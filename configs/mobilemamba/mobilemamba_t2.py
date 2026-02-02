@@ -44,7 +44,7 @@ data.test_transforms = [
 ]
 # =========> model <=================================
 model = _Namespace()
-model.name = 'MobileMamba_T2'
+model.name = 'FMobileMamba_T2'
 model.model_kwargs = dict(pretrained=False, checkpoint_path='', ema=False, strict=True, num_classes=data.nb_classes)
 
 # =========> optimizer <=================================
@@ -54,7 +54,7 @@ optim.optim_kwargs = dict(name='adamw', betas=(0.9, 0.999), eps=1e-8, weight_dec
 # =========> trainer <=================================
 trainer = _Namespace()
 trainer.name = 'CLSTrainer'
-trainer.checkpoint = 'runs/mobilemamba/500_epochs'
+trainer.checkpoint = 'runs/mobilemamba_lo/500_epochs'
 trainer.resume_dir = ''
 trainer.cuda_deterministic = False
 trainer.epoch_full = epoch_full

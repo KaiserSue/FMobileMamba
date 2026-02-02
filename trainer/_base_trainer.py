@@ -31,6 +31,13 @@ from . import TRAINER
 from .loss_recorder import LossRecorder
 
 
+def log_global_mode(logger, net):
+    global_mode = getattr(net, 'global_mode', None)
+    if global_mode is None:
+        return
+    log_msg(logger, f'==> global_mode: {global_mode}')
+
+
 @TRAINER.register_module
 class BaseTrainer():
     def __init__(self, cfg):
@@ -53,6 +60,7 @@ class BaseTrainer():
         log_msg(self.logger, f"==> Load checkpoint: {cfg.model.model_kwargs['checkpoint_path']}") if \
         cfg.model.model_kwargs['checkpoint_path'] else None
         print_networks([self.net], self.cfg.size, self.logger)
+        log_global_mode(self.logger, self.net)
         self.dist_BN = cfg.trainer.dist_BN
         if cfg.dist and cfg.trainer.sync_BN != 'none':
             self.dist_BN = ''
