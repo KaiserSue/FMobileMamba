@@ -1,18 +1,19 @@
 from argparse import Namespace as _Namespace
+from copy import deepcopy as _deepcopy
+from model.mobilemamba.mobilemamba import CFG_MobileMamba_B1 as _CFG_B1
 from timm.data.constants import IMAGENET_DEFAULT_MEAN as _IMAGENET_DEFAULT_MEAN
 from timm.data.constants import IMAGENET_DEFAULT_STD as _IMAGENET_DEFAULT_STD
 import torchvision.transforms.functional as _F
-
 # =========> shared <=================================
 seed = 42
-size = 256
-epoch_full = 300
-warmup_epochs = 20
-test_start_epoch = 200
-batch_size = 1024
-lr = 1.5e-3
+size = 192
+epoch_full = 500
+warmup_epochs = 30
+test_start_epoch = 400
+batch_size = 200
+lr = 1.5e-4
 weight_decay = 0.05
-nb_classes = 1000
+nb_classes = 100
 
 ft = False
 if ft:
@@ -23,12 +24,15 @@ if ft:
 
 # =========> dataset <=================================
 data = _Namespace()
-data.type = 'ImageFolderLMDB'
-data.root = 'data/imagenet'
+data.type = 'DefaultCLS'
+data.root_dir = '/home/kaiser/dl_project/data/plant_leave_data'
+data.train_subdir = 'train'
+data.val_subdir = 'val'
+data.test_subdir = 'test'
+data.root = data.root_dir
 data.loader_type = 'pil'
 data.sampler = 'naive'
 data.nb_classes = nb_classes
-
 data.train_transforms = [
 	dict(type='timm_create_transform', input_size=size, is_training=True, color_jitter=0.4,
 		 auto_augment='rand-m9-mstd0.5-inc1', interpolation='random', mean=_IMAGENET_DEFAULT_MEAN, std=_IMAGENET_DEFAULT_STD,
@@ -40,11 +44,16 @@ data.test_transforms = [
 	dict(type='ToTensor'),
 	dict(type='Normalize', mean=_IMAGENET_DEFAULT_MEAN, std=_IMAGENET_DEFAULT_STD, inplace=True),
 ]
-
 # =========> model <=================================
 model = _Namespace()
-model.name = 'MobileMamba_B1'
-model.model_kwargs = dict(pretrained=False, checkpoint_path='', ema=False, strict=True, num_classes=data.nb_classes)
+model.name = 'FMobileMamba_B1'
+_model_cfg = _deepcopy(_CFG_B1)
+_model_cfg.update(img_size=192, in_chans=3, stages=['s', 's', 's'],
+                  kernels_padding=[[11, 5], [7, 3], [5, 2]],
+                  down_ops=[['subsample', 2], ['subsample', 2], ['']],
+                  forward_type='v052d', global_mode='fft', local_mode='layeroperator')
+model.model_kwargs = dict(pretrained=False, checkpoint_path='', ema=False, strict=True,
+                          num_classes=data.nb_classes, distillation=False, model_cfg=_model_cfg)
 
 # =========> optimizer <=================================
 optim = _Namespace()
@@ -53,7 +62,7 @@ optim.optim_kwargs = dict(name='adamw', betas=(0.9, 0.999), eps=1e-8, weight_dec
 # =========> trainer <=================================
 trainer = _Namespace()
 trainer.name = 'CLSTrainer'
-trainer.checkpoint = 'runs/mobilemamba'
+trainer.checkpoint = 'runs/mobilemamba/500_epochs_fmobilemamba_b1'
 trainer.resume_dir = ''
 trainer.cuda_deterministic = False
 trainer.epoch_full = epoch_full
@@ -73,14 +82,14 @@ trainer.data.pin_memory = True
 trainer.data.persistent_workers = False
 
 trainer.mixup_kwargs = dict(
-	mixup_alpha=0.8, cutmix_alpha=1.0, cutmix_minmax=None, prob=1.0, switch_prob=0.5,
+	mixup_alpha=0, cutmix_alpha=1.0, cutmix_minmax=None, prob=1, switch_prob=0,
 	mode='batch', correct_lam=True, label_smoothing=0.1, num_classes=data.nb_classes)
 
 trainer.scale_kwargs = dict(n_scale=0, base_h=size, base_w=size, min_h=160, max_h=320, min_w=160, max_w=320, check_scale_div_factor=32)
 
 trainer.test_start_epoch = test_start_epoch
 trainer.test_per_epoch = 5
-trainer.save_per_epoch = 15
+trainer.save_per_epoch = 20
 trainer.find_unused_parameters = False
 trainer.sync_BN = 'none'  # [none, native, apex, timm]
 trainer.dist_BN = '' # [ , reduce, broadcast], valid when sync_BN is 'none'

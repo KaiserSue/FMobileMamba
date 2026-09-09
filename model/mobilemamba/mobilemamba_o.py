@@ -10,9 +10,7 @@ from functools import partial
 import pywt
 import pywt.data
 from timm.layers import DropPath
-from model.mobilemamba.FDConv import FDConv
-#from basic_modules import ConvLayer
-# ----------------- Wavelet Transform Functions -----------------
+
 def create_wavelet_filter(wave, in_size, out_size, type=torch.float):
     w = pywt.Wavelet(wave)
     dec_hi = torch.tensor(w.dec_hi[::-1], dtype=type)
@@ -49,6 +47,7 @@ def inverse_wavelet_transform(x, filters):
     x = x.reshape(b, c * 4, h_half, w_half)
     x = F.conv_transpose2d(x, filters, stride=2, groups=c, padding=pad)
     return x
+
 # Layer operator
 class LayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
@@ -70,7 +69,7 @@ class LayerNorm(nn.Module):
             x = (x - u) / torch.sqrt(s + self.eps)
             x = self.weight[:, None, None] * x + self.bias[:, None, None]
             return x
-
+#---------------------------Layer operator---------------------------
 class Layer_operator(nn.Module):
     def __init__(self, in_channel, Kernel_padding):
         super().__init__()
@@ -99,106 +98,37 @@ class Layer_operator(nn.Module):
         small_rec_branch = self.small_conv(h_1)
         out = torch.cat((big_rec_branch, small_rec_branch), dim=1)
         return out
-# ----------------- FFT Transform Functions -----------------
-def fft_transform(x):
-    if x.dtype == torch.float16:
-        x = x.to(torch.float32)
-    y = torch.fft.rfft2(x,norm = 'backward')
-    real = y.real
-    imag = y.imag
-    fft_result = torch.cat((real, imag), dim=1)
-    return fft_result
 
-def ifft_transform(x,H,W):
-    if x.dtype == torch.float16:
-        x = x.to(torch.float32)
-    y = torch.fft.irfft2(x,s=(H,W),norm = 'backward')
-    return y
-
-class FFTConvLayer(nn.Module):
-    def __init__(self, in_channel):
-        super(FFTConvLayer, self).__init__()
-        self.conv = nn.Sequential(
-            ConvLayer(in_channel * 2, in_channel * 2, kernel=1, norm=True,act=True,dilation=1, groups= in_channel * 2),
-            ConvLayer(in_channel * 2, in_channel * 2, kernel=3, act=True, padding='same',dilation=1, groups= in_channel * 2)
-        )
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        if x.dtype == torch.float16:
-            x = x.to(torch.float32)
-        x_fft = torch.fft.rfft2(x, norm='backward')
-        real = x_fft.real
-        imag = x_fft.imag
-        x_realimag = torch.cat([real, imag], dim=1)  # shape [B, 2C, H, W//2 + 1]
-        x_conv = self.conv(x_realimag)
-        real, imag = torch.chunk(x_conv, 2, dim=1)
-        if real.dtype == torch.float16:
-            real = real.to(torch.float32)
-            imag = imag.to(torch.float32)
-        x_complex = torch.complex(real, imag)  # [B, C, H, W//2 + 1]
-        x_out = torch.fft.irfft2(x_complex, s=(H, W), norm='backward')
-        return x_out
-
-
-# ========= ConvLayer ==========
-class ConvLayer(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel,
-                 norm=False, act=False,
-                 stride=1, padding=0, dilation=1, groups=1):
-        super(ConvLayer, self).__init__()
-        layers = list()
-        layers.append(nn.Conv2d(
-            in_channel,
-            out_channel,
-            kernel_size=kernel,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups
-        ))
-        if norm:
-            layers.append(nn.BatchNorm2d(out_channel))
-        if act:
-            layers.append(nn.ReLU(inplace=True))
-        self.conv = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.conv(x)
-
-# ----------------- MBWTConv -----------------------------
 class MBWTConv2d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, bias=True, wt_levels=1, wt_type='db1',ssm_ratio=1,forward_type="v05",):
         super(MBWTConv2d, self).__init__()
 
         assert in_channels == out_channels
-        # self.is_FFT = True
+
         self.in_channels = in_channels
-        #self.wt_levels = wt_levels
+        self.wt_levels = wt_levels
         self.stride = stride
         self.dilation = 1
-        # use WT
-        '''
+
         self.wt_filter, self.iwt_filter = create_wavelet_filter(wt_type, in_channels, in_channels, torch.float)
         self.wt_filter = nn.Parameter(self.wt_filter, requires_grad=False)
         self.iwt_filter = nn.Parameter(self.iwt_filter, requires_grad=False)
+
         self.wt_function = partial(wavelet_transform, filters=self.wt_filter)
         self.iwt_function = partial(inverse_wavelet_transform, filters=self.iwt_filter)
-        '''
-        # use FFT
-        self.fft_conv = FFTConvLayer(in_channels)
+
         self.global_atten =SS2D(d_model=in_channels, d_state=1,
              ssm_ratio=ssm_ratio, initialize="v2", forward_type=forward_type, channel_first=True, k_group=2)
         self.base_scale = _ScaleModule([1, in_channels, 1, 1])
-        '''
+
         self.wavelet_convs = nn.ModuleList(
             [nn.Conv2d(in_channels * 4, in_channels * 4, kernel_size, padding='same', stride=1, dilation=1,
                        groups=in_channels * 4, bias=False) for _ in range(self.wt_levels)]
         )
+
         self.wavelet_scale = nn.ModuleList(
             [_ScaleModule([1, in_channels * 4, 1, 1], init_scale=0.1) for _ in range(self.wt_levels)]
         )
-        '''
 
         if self.stride > 1:
             self.stride_filter = nn.Parameter(torch.ones(in_channels, 1, 1, 1), requires_grad=False)
@@ -208,12 +138,51 @@ class MBWTConv2d(nn.Module):
             self.do_stride = None
 
     def forward(self, x):
-        # FFT in forward
-        # _,C,H,W = x.shape
-        x_fft = self.fft_conv(x)
-        x_mamba = self.base_scale(self.global_atten(x))
-        #x = x + x_tag
-        x = x_fft + x_mamba
+
+        x_ll_in_levels = []
+        x_h_in_levels = []
+        shapes_in_levels = []
+
+        curr_x_ll = x
+
+        for i in range(self.wt_levels):
+            curr_shape = curr_x_ll.shape
+            shapes_in_levels.append(curr_shape)
+            if (curr_shape[2] % 2 > 0) or (curr_shape[3] % 2 > 0):
+                curr_pads = (0, curr_shape[3] % 2, 0, curr_shape[2] % 2)
+                curr_x_ll = F.pad(curr_x_ll, curr_pads)
+
+            curr_x = self.wt_function(curr_x_ll)
+            curr_x_ll = curr_x[:, :, 0, :, :]
+
+            shape_x = curr_x.shape
+            curr_x_tag = curr_x.reshape(shape_x[0], shape_x[1] * 4, shape_x[3], shape_x[4])
+            curr_x_tag = self.wavelet_scale[i](self.wavelet_convs[i](curr_x_tag))
+            curr_x_tag = curr_x_tag.reshape(shape_x)
+
+            x_ll_in_levels.append(curr_x_tag[:, :, 0, :, :])
+            x_h_in_levels.append(curr_x_tag[:, :, 1:4, :, :])
+
+        next_x_ll = 0
+
+        for i in range(self.wt_levels - 1, -1, -1):
+            curr_x_ll = x_ll_in_levels.pop()
+            curr_x_h = x_h_in_levels.pop()
+            curr_shape = shapes_in_levels.pop()
+
+            curr_x_ll = curr_x_ll + next_x_ll
+
+            curr_x = torch.cat([curr_x_ll.unsqueeze(2), curr_x_h], dim=2)
+            next_x_ll = self.iwt_function(curr_x)
+
+            next_x_ll = next_x_ll[:, :, :curr_shape[2], :curr_shape[3]]
+
+        x_tag = next_x_ll
+        assert len(x_ll_in_levels) == 0
+
+        x = self.base_scale(self.global_atten(x))
+        x = x + x_tag
+
         if self.do_stride is not None:
             x = self.do_stride(x)
 
@@ -229,6 +198,7 @@ class _ScaleModule(nn.Module):
 
     def forward(self, x):
         return torch.mul(self.weight, x)
+
 class DWConv2d_BN_ReLU(nn.Sequential):
     def __init__(self, in_channels, out_channels, kernel_size=3, bn_weight_init=1):
         super().__init__()
@@ -384,11 +354,9 @@ def nearest_multiple_of_16(n):
 
 class MobileMambaModule(torch.nn.Module):
     def __init__(self, dim, global_ratio=0.25, local_ratio=0.25,
-                 kernels_padding = [5,2], kernels = 3,ssm_ratio=1, forward_type="v052d",):
+                 kernels=3, ssm_ratio=1, forward_type="v052d",):
         super().__init__()
         self.dim = dim
-        self.kernels = kernels
-        #self.kernels = kernels_padding[0]
         self.global_channels = nearest_multiple_of_16(int(global_ratio * dim))
         if self.global_channels + int(local_ratio * dim) > dim:
             self.local_channels = dim - self.global_channels
@@ -396,13 +364,12 @@ class MobileMambaModule(torch.nn.Module):
             self.local_channels = int(local_ratio * dim)
         self.identity_channels = self.dim - self.global_channels - self.local_channels
         if self.local_channels != 0:
-            #self.local_op = DWConv2d_BN_ReLU(self.local_channels, self.local_channels, self.kernels)
-            #self.local_op = FDConv(self.local_channels,self.local_channels,kernels, padding=kernels // 2)
-            self.local_op = Layer_operator(self.local_channels,kernels_padding)
+            self.local_op = DWConv2d_BN_ReLU(self.local_channels, self.local_channels, kernels)
+            #self.local_op = Layer_operator(self.local_channels,kernels_padding)
         else:
             self.local_op = nn.Identity()
         if self.global_channels != 0:
-            self.global_op = MBWTConv2d(self.global_channels, self.global_channels, self.kernels, wt_levels=1, ssm_ratio=ssm_ratio, forward_type=forward_type,)
+            self.global_op = MBWTConv2d(self.global_channels, self.global_channels, kernels, wt_levels=1, ssm_ratio=ssm_ratio, forward_type=forward_type,)
         else:
             self.global_op = nn.Identity()
 
@@ -419,11 +386,12 @@ class MobileMambaModule(torch.nn.Module):
 
 class MobileMambaBlockWindow(torch.nn.Module):
     def __init__(self, dim, global_ratio=0.25, local_ratio=0.25,
-                 kernels_padding = [5,2], kernels = 3, ssm_ratio=1, forward_type="v052d",):
+                 kernels=5, ssm_ratio=1, forward_type="v052d",):
         super().__init__()
         self.dim = dim
         self.attn = MobileMambaModule(dim, global_ratio=global_ratio, local_ratio=local_ratio,
-                                           kernels_padding=kernels_padding, kernels=kernels, ssm_ratio=ssm_ratio, forward_type=forward_type,)
+                                           kernels=kernels, ssm_ratio=ssm_ratio, forward_type=forward_type,)
+
     def forward(self, x):
         x = self.attn(x)
         return x
@@ -432,7 +400,7 @@ class MobileMambaBlockWindow(torch.nn.Module):
 class MobileMambaBlock(torch.nn.Module):
     def __init__(self, type,
                  ed, global_ratio=0.25, local_ratio=0.25,
-                 kernels_padding = [5,2], kernels = 3, drop_path=0., has_skip=True, ssm_ratio=1, forward_type="v052d"):
+                 kernels=5,  drop_path=0., has_skip=True, ssm_ratio=1, forward_type="v052d"):
         super().__init__()
 
         self.dw0 = Residual(Conv2d_BN(ed, ed, 3, 1, 1, groups=ed, bn_weight_init=0.))
@@ -440,7 +408,7 @@ class MobileMambaBlock(torch.nn.Module):
 
         if type == 's':
             self.mixer = Residual(MobileMambaBlockWindow(ed, global_ratio=global_ratio, local_ratio=local_ratio,
-                                                       kernels_padding=kernels_padding, kernels=kernels, ssm_ratio=ssm_ratio,forward_type=forward_type))
+                                                       kernels=kernels, ssm_ratio=ssm_ratio,forward_type=forward_type))
 
         self.dw1 = Residual(Conv2d_BN(ed, ed, 3, 1, 1, groups=ed, bn_weight_init=0.,))
         self.ffn1 = Residual(FFN(ed, int(ed * 2)))
@@ -465,14 +433,12 @@ class MobileMamba(torch.nn.Module):
                  global_ratio=[0.8, 0.7, 0.6],
                  local_ratio=[0.2, 0.2, 0.3],
                  depth=[1, 2, 2],
-                 kernels_padding=[[11,5], [7,3], [5,2]],
                  kernels=[7, 5, 3],
                  down_ops=[['subsample', 2], ['subsample', 2], ['']],
                  distillation=False, drop_path=0., ssm_ratio=1, forward_type="v052d"):
         super().__init__()
 
         resolution = img_size
-        
         # Patch embedding
         self.patch_embed = torch.nn.Sequential(Conv2d_BN(in_chans, embed_dim[0] // 8, 3, 2, 1),
                                                torch.nn.ReLU(),
@@ -492,10 +458,8 @@ class MobileMamba(torch.nn.Module):
         for i, (stg, ed, dpth, gr, lr, do) in enumerate(
                 zip(stages, embed_dim, depth, global_ratio, local_ratio, down_ops)):
             dpr = dprs[sum(depth[:i]):sum(depth[:i + 1])]
-            self.kernels_padding = kernels_padding[i]
-            self.kernels = kernels[i]
             for d in range(dpth):
-                eval('self.blocks' + str(i + 1)).append(MobileMambaBlock(stg, ed, gr, lr, self.kernels_padding, self.kernels, dpr[d], ssm_ratio=ssm_ratio, forward_type=forward_type))
+                eval('self.blocks' + str(i + 1)).append(MobileMambaBlock(stg, ed, gr, lr, kernels[i], dpr[d], ssm_ratio=ssm_ratio, forward_type=forward_type))
             if do[0] == 'subsample':
                 # Build MobileMamba downsample block
                 # ('Subsample' stride)
@@ -553,7 +517,6 @@ CFG_MobileMamba_T2 = {
         'depth': [1, 2, 2],
         'global_ratio': [0.8, 0.7, 0.6],
         'local_ratio': [0.2, 0.2, 0.3],
-        'kernels_padding': [[11,5], [7,3], [5,2]],
         'kernels': [7, 5, 3],
         'drop_path': 0,
         'ssm_ratio': 2,
@@ -611,37 +574,37 @@ CFG_MobileMamba_B4 = {
 
 
 @MODEL.register_module
-def FMobileMamba_T2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_T2):
+def MobileMamba_T2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_T2):
     model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 @MODEL.register_module
-def FMobileMamba_T4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_T4):
+def MobileMamba_T4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_T4):
     model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 @MODEL.register_module
-def FMobileMamba_S6(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_S6):
+def MobileMamba_S6(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_S6):
     model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 @MODEL.register_module
-def FMobileMamba_B1(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B1):
+def MobileMamba_B1(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B1):
     model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 @MODEL.register_module
-def FMobileMamba_B2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B2):
+def MobileMamba_B2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B2):
     model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
     if fuse:
         replace_batchnorm(model)
     return model
 @MODEL.register_module
-def FMobileMamba_B4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B4):
+def MobileMamba_B4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B4):
     model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
     if fuse:
         replace_batchnorm(model)
@@ -661,12 +624,12 @@ if __name__ == "__main__":
 
 
     model_dict = {
-        "FMobileMamba_T2": FMobileMamba_T2,
-        "FMobileMamba_T4": FMobileMamba_T4,
-        "FMobileMamba_S6": FMobileMamba_S6,
-        "FMobileMamba_B1": FMobileMamba_B1,
-        "FMobileMamba_B2": FMobileMamba_B2,
-        "FMobileMamba_B4": FMobileMamba_B4,
+        "MobileMamba_T2": MobileMamba_T2,
+        "MobileMamba_T4": MobileMamba_T4,
+        "MobileMamba_S6": MobileMamba_S6,
+        "MobileMamba_B1": MobileMamba_B1,
+        "MobileMamba_B2": MobileMamba_B2,
+        "MobileMamba_B4": MobileMamba_B4,
     }
 
     parser = argparse.ArgumentParser()
@@ -703,3 +666,4 @@ if __name__ == "__main__":
         t_e = get_timepc()
         speed = f'{bs * cnt / (t_e - t_s):>7.3f}'
         print(f'[Batchsize: {bs}]\t [GPU-Speed: {speed}]\t')
+

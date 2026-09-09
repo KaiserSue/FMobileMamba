@@ -1,7 +1,6 @@
 import torch
 import warnings
 import os
-os.environ["TRITON_INTERPRET"] = "1"
 
 WITH_TRITON = True
 # WITH_TRITON = False
@@ -65,8 +64,7 @@ def cross_merge_fwd(y: torch.Tensor, in_channel_first=True, out_channel_first=Tr
         elif scans == 1:
             y = y.sum(1)
         elif scans == 2:
-            y = y[:, 0] + y[:, 1].flip(dims=[-1]).view(B, 1, D, -1)
-            y = y.sum(1)
+            y = y[:, 0] + y[:, 1].flip(dims=[-1])
     else:
         B, H, W, K, D = y.shape
         y = y.view(B, -1, K, D)
@@ -76,8 +74,7 @@ def cross_merge_fwd(y: torch.Tensor, in_channel_first=True, out_channel_first=Tr
         elif scans == 1:
             y = y.sum(2)
         elif scans == 2:
-            y = y[:, :, 0] + y[:, :, 1].flip(dims=[1]).view(B, -1, 1, D)
-            y = y.sum(2)
+            y = y[:, :, 0] + y[:, :, 1].flip(dims=[1])
 
     if in_channel_first and (not out_channel_first):
         y = y.permute(0, 2, 1).contiguous()

@@ -1,0 +1,45 @@
+# Captured from Conda environment MobileMamba (Python 3.8.20).
+# PyTorch CUDA 11.8 wheels and the matching prebuilt MMCV wheel index.
+--extra-index-url https://download.pytorch.org/whl/cu118
+--find-links https://download.openmmlab.com/mmcv/dist/cu118/torch2.1/index.html
+
+# Core training and model runtime
+einops==0.8.1
+fvcore==0.1.5.post20221221
+lmdb==1.7.2
+matplotlib==3.7.5
+numpy==1.24.1
+opencv-python==4.12.0.88
+pillow==10.2.0
+PyWavelets==1.4.1
+scikit-image==0.21.0
+tensorboardX==2.6.2.2
+timm==0.9.16
+torch==2.1.2+cu118
+torchvision==0.16.2+cu118
+tqdm==4.67.1
+triton==2.1.0
+
+# Detection, evaluation, and repository tools available in MobileMamba
+addict==2.4.0
+mmcv==2.1.0
+mmengine==0.10.7
+pandas==2.0.3
+psutil==6.0.0
+pycocotools==2.0.7
+requests==2.28.1
+rich==14.3.4
+scipy==1.10.1
+shapely==2.0.7
+six==1.16.0
+terminaltables==3.1.10
+
+# Local CUDA extension build dependencies
+ninja==1.11.1.4
+packaging==25.0
+setuptools==75.1.0
+wheel==0.44.0
+
+# Project-local selective scan CUDA extension (package version: 0.0.2).
+# Its setup.py imports torch, so torch and the CUDA toolchain must exist first.
+./model/lib_mamba/kernels/selective_scan

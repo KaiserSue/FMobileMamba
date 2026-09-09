@@ -74,7 +74,15 @@ class LayerNorm(nn.Module):
 class Layer_operator(nn.Module):
     def __init__(self, in_channel, Kernel_padding):
         super().__init__()
+        if type(in_channel) is not int or in_channel < 2:
+            raise ValueError("in_channel must be an integer >= 2")
+        if (not isinstance(Kernel_padding, (tuple, list)) or len(Kernel_padding) != 2
+                or any(type(v) is not int for v in Kernel_padding)
+                or Kernel_padding[0] <= 0 or Kernel_padding[0] % 2 != 1
+                or Kernel_padding[1] != Kernel_padding[0] // 2):
+            raise ValueError("Kernel_padding must contain an odd positive kernel and size-preserving padding")
         self.in_channel = in_channel
+        self.split_channels = (in_channel // 2, in_channel - in_channel // 2)
         self.kernel = Kernel_padding[0]
         self.padding = Kernel_padding[1]
         self.norm1 = LayerNorm(in_channel, eps=1e-6, data_format="channels_first")
@@ -85,12 +93,12 @@ class Layer_operator(nn.Module):
         )
         self.conv1x1_1 = nn.Conv2d(in_channel//2, in_channel//2, 1)
         self.conv1x1_2 = nn.Conv2d(in_channel//2, in_channel//2, 1)
-        self.conv1x1_3 = nn.Conv2d(in_channel//2, in_channel//2, 1)
+        self.conv1x1_3 = nn.Conv2d(self.split_channels[1], self.split_channels[1], 1)
 
-        self.small_conv = nn.Conv2d(in_channel//2, in_channel//2, 3, padding=1, groups=in_channel//2)
+        self.small_conv = nn.Conv2d(self.split_channels[1], self.split_channels[1], 3, padding=1, groups=self.split_channels[1])
     def forward(self, x):
         x = self.norm1(x)
-        x_split = torch.split(x, self.in_channel//2, dim=1)
+        x_split = torch.split(x, self.split_channels, dim=1)
         h_0 = self.big_conv(x_split[0])
         res = self.conv1x1_1(x_split[0])
         big_rec_branch = self.conv1x1_2(h_0 + res)
@@ -482,8 +490,10 @@ def nearest_multiple_of_16(n):
 
 class MobileMambaModule(torch.nn.Module):
     def __init__(self, dim, global_ratio=0.25, local_ratio=0.25,
-                 kernels_padding = [5,2], kernels = 3,ssm_ratio=1, forward_type="v052d", global_mode="WT",):
+                 kernels_padding = [5,2], kernels = 3,ssm_ratio=1, forward_type="v052d", global_mode="fft", local_mode="layeroperator",):
         super().__init__()
+        if local_mode not in ("layeroperator", "dwconv"):
+            raise ValueError("local_mode must be layeroperator or dwconv")
         self.dim = dim
         self.kernels = kernels
         #self.kernels = kernels_padding[0]
@@ -494,9 +504,10 @@ class MobileMambaModule(torch.nn.Module):
             self.local_channels = int(local_ratio * dim)
         self.identity_channels = self.dim - self.global_channels - self.local_channels
         if self.local_channels != 0:
-            #self.local_op = DWConv2d_BN_ReLU(self.local_channels, self.local_channels, self.kernels)
-            #self.local_op = FDConv(self.local_channels,self.local_channels,kernels, padding=kernels // 2)
-            self.local_op = Layer_operator(self.local_channels,kernels_padding)
+            if local_mode == "layeroperator":
+                self.local_op = Layer_operator(self.local_channels, kernels_padding)
+            else:
+                self.local_op = DWConv2d_BN_ReLU(self.local_channels, self.local_channels, self.kernels)
         else:
             self.local_op = nn.Identity()
         if self.global_channels != 0:
@@ -522,11 +533,11 @@ class MobileMambaModule(torch.nn.Module):
 
 class MobileMambaBlockWindow(torch.nn.Module):
     def __init__(self, dim, global_ratio=0.25, local_ratio=0.25,
-                 kernels_padding = [5,2], kernels = 3, ssm_ratio=1, forward_type="v052d", global_mode="FFT",):
+                 kernels_padding = [5,2], kernels = 3, ssm_ratio=1, forward_type="v052d", global_mode="FFT", local_mode="layeroperator",):
         super().__init__()
         self.dim = dim
         self.attn = MobileMambaModule(dim, global_ratio=global_ratio, local_ratio=local_ratio,
-                                           kernels_padding=kernels_padding, kernels=kernels, ssm_ratio=ssm_ratio, forward_type=forward_type, global_mode=global_mode,)
+                                           kernels_padding=kernels_padding, kernels=kernels, ssm_ratio=ssm_ratio, forward_type=forward_type, global_mode=global_mode, local_mode=local_mode,)
     def forward(self, x):
         x = self.attn(x)
         return x
@@ -535,7 +546,7 @@ class MobileMambaBlockWindow(torch.nn.Module):
 class MobileMambaBlock(torch.nn.Module):
     def __init__(self, type,
                  ed, global_ratio=0.25, local_ratio=0.25,
-                 kernels_padding = [5,2], kernels = 3, drop_path=0., has_skip=True, ssm_ratio=1, forward_type="v052d", global_mode="FFT"):
+                 kernels_padding = [5,2], kernels = 3, drop_path=0., has_skip=True, ssm_ratio=1, forward_type="v052d", global_mode="wt", local_mode="layeroperator"):
         super().__init__()
 
         self.dw0 = Residual(Conv2d_BN(ed, ed, 3, 1, 1, groups=ed, bn_weight_init=0.))
@@ -543,7 +554,7 @@ class MobileMambaBlock(torch.nn.Module):
 
         if type == 's':
             self.mixer = Residual(MobileMambaBlockWindow(ed, global_ratio=global_ratio, local_ratio=local_ratio,
-                                                       kernels_padding=kernels_padding, kernels=kernels, ssm_ratio=ssm_ratio,forward_type=forward_type, global_mode=global_mode))
+                                                       kernels_padding=kernels_padding, kernels=kernels, ssm_ratio=ssm_ratio,forward_type=forward_type, global_mode=global_mode, local_mode=local_mode))
 
         self.dw1 = Residual(Conv2d_BN(ed, ed, 3, 1, 1, groups=ed, bn_weight_init=0.,))
         self.ffn1 = Residual(FFN(ed, int(ed * 2)))
@@ -571,7 +582,7 @@ class MobileMamba(torch.nn.Module):
                  kernels_padding=[[11,5], [7,3], [5,2]],
                  kernels=[7, 5, 3],
                  down_ops=[['subsample', 2], ['subsample', 2], ['']],
-                 distillation=False, drop_path=0., ssm_ratio=1, forward_type="v052d", global_mode="wt"):
+                 distillation=False, drop_path=0., ssm_ratio=1, forward_type="v052d", global_mode="wt", local_mode="layeroperator"):
         super().__init__()
 
         resolution = img_size
@@ -599,7 +610,7 @@ class MobileMamba(torch.nn.Module):
             self.kernels_padding = kernels_padding[i]
             self.kernels = kernels[i]
             for d in range(dpth):
-                eval('self.blocks' + str(i + 1)).append(MobileMambaBlock(stg, ed, gr, lr, self.kernels_padding, self.kernels, dpr[d], ssm_ratio=ssm_ratio, forward_type=forward_type, global_mode=self.global_mode))
+                eval('self.blocks' + str(i + 1)).append(MobileMambaBlock(stg, ed, gr, lr, self.kernels_padding, self.kernels, dpr[d], ssm_ratio=ssm_ratio, forward_type=forward_type, global_mode=self.global_mode, local_mode=local_mode))
             if do[0] == 'subsample':
                 # Build MobileMamba downsample block
                 # ('Subsample' stride)
@@ -626,11 +637,27 @@ class MobileMamba(torch.nn.Module):
     def no_weight_decay(self):
         return {x for x in self.state_dict().keys() if 'attention_biases' in x}
 
+    def forward_features(self, x, out_indices=(1, 2, 3)):
+        """Return selected stem/stage features, stopping at the last requested stage."""
+        if (not isinstance(out_indices, tuple) or not out_indices
+                or any(type(i) is not int or not 0 <= i <= 3 for i in out_indices)
+                or any(a >= b for a, b in zip(out_indices, out_indices[1:]))):
+            raise ValueError("out_indices must be a nonempty strictly increasing tuple in 0..3")
+        if (not isinstance(x, torch.Tensor) or x.ndim != 4
+                or not x.is_floating_point() or min(x.shape) <= 0
+                or x.shape[1] != self.patch_embed[0].c.in_channels):
+            raise ValueError("x must be a nonempty floating NCHW tensor with matching input channels")
+        outputs = []
+        for index, stage in enumerate((self.patch_embed, self.blocks1, self.blocks2, self.blocks3)):
+            x = stage(x)
+            if index in out_indices:
+                outputs.append(x)
+            if index == out_indices[-1]:
+                break
+        return tuple(outputs)
+
     def forward(self, x):
-        x = self.patch_embed(x)
-        x = self.blocks1(x)
-        x = self.blocks2(x)
-        x = self.blocks3(x)
+        x = self.forward_features(x, out_indices=(3,))[0]
         x = torch.nn.functional.adaptive_avg_pool2d(x, 1).flatten(1)
         if self.distillation:
             x = self.head(x), self.head_dist(x)
@@ -714,42 +741,65 @@ CFG_MobileMamba_B4 = {
     }
 
 
-@MODEL.register_module
-def FMobileMamba_T2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_T2):
-    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
+def _build_fmobilemamba(model_cfg, num_classes, distillation, fuse,
+                        global_mode=None, local_mode=None):
+    model_options = dict(model_cfg)
+    if global_mode is not None:
+        model_options["global_mode"] = global_mode
+    if local_mode is not None:
+        model_options["local_mode"] = local_mode
+    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_options)
     if fuse:
         replace_batchnorm(model)
     return model
+
+
 @MODEL.register_module
-def FMobileMamba_T4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_T4):
-    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
-    if fuse:
-        replace_batchnorm(model)
-    return model
+def FMobileMamba_T2(num_classes=1000, pretrained=False, distillation=False, fuse=False,
+                    pretrained_cfg=None, model_cfg=CFG_MobileMamba_T2,
+                    global_mode=None, local_mode=None):
+    return _build_fmobilemamba(
+        model_cfg, num_classes, distillation, fuse, global_mode, local_mode)
+
+
 @MODEL.register_module
-def FMobileMamba_S6(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_S6):
-    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
-    if fuse:
-        replace_batchnorm(model)
-    return model
+def FMobileMamba_T4(num_classes=1000, pretrained=False, distillation=False, fuse=False,
+                    pretrained_cfg=None, model_cfg=CFG_MobileMamba_T4,
+                    global_mode=None, local_mode=None):
+    return _build_fmobilemamba(
+        model_cfg, num_classes, distillation, fuse, global_mode, local_mode)
+
+
 @MODEL.register_module
-def FMobileMamba_B1(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B1):
-    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
-    if fuse:
-        replace_batchnorm(model)
-    return model
+def FMobileMamba_S6(num_classes=1000, pretrained=False, distillation=False, fuse=False,
+                    pretrained_cfg=None, model_cfg=CFG_MobileMamba_S6,
+                    global_mode=None, local_mode=None):
+    return _build_fmobilemamba(
+        model_cfg, num_classes, distillation, fuse, global_mode, local_mode)
+
+
 @MODEL.register_module
-def FMobileMamba_B2(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B2):
-    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
-    if fuse:
-        replace_batchnorm(model)
-    return model
+def FMobileMamba_B1(num_classes=1000, pretrained=False, distillation=False, fuse=False,
+                    pretrained_cfg=None, model_cfg=CFG_MobileMamba_B1,
+                    global_mode=None, local_mode=None):
+    return _build_fmobilemamba(
+        model_cfg, num_classes, distillation, fuse, global_mode, local_mode)
+
+
 @MODEL.register_module
-def FMobileMamba_B4(num_classes=1000, pretrained=False, distillation=False, fuse=False, pretrained_cfg=None, model_cfg=CFG_MobileMamba_B4):
-    model = MobileMamba(num_classes=num_classes, distillation=distillation, **model_cfg)
-    if fuse:
-        replace_batchnorm(model)
-    return model
+def FMobileMamba_B2(num_classes=1000, pretrained=False, distillation=False, fuse=False,
+                    pretrained_cfg=None, model_cfg=CFG_MobileMamba_B2,
+                    global_mode=None, local_mode=None):
+    return _build_fmobilemamba(
+        model_cfg, num_classes, distillation, fuse, global_mode, local_mode)
+
+
+@MODEL.register_module
+def FMobileMamba_B4(num_classes=1000, pretrained=False, distillation=False, fuse=False,
+                    pretrained_cfg=None, model_cfg=CFG_MobileMamba_B4,
+                    global_mode=None, local_mode=None):
+    return _build_fmobilemamba(
+        model_cfg, num_classes, distillation, fuse, global_mode, local_mode)
 
 
 if __name__ == "__main__":

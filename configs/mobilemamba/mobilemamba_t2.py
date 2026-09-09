@@ -54,7 +54,7 @@ optim.optim_kwargs = dict(name='adamw', betas=(0.9, 0.999), eps=1e-8, weight_dec
 # =========> trainer <=================================
 trainer = _Namespace()
 trainer.name = 'CLSTrainer'
-trainer.checkpoint = 'runs/mobilemamba_lo/500_epochs'
+trainer.checkpoint = 'runs/mobilemamba/500_epochs_mobilemamba'
 trainer.resume_dir = ''
 trainer.cuda_deterministic = False
 trainer.epoch_full = epoch_full
