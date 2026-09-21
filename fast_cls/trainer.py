@@ -37,7 +37,7 @@ class EvalResult:
 
 
 class FastCLSTrainer:
-    def __init__(self, cfg):
+    def __init__(self, cfg, fold_context=None, resume_checkpoint=None):
         from model import get_model
         from loss import get_loss_terms
         from optim import get_optim
@@ -45,11 +45,12 @@ class FastCLSTrainer:
         from util.net import get_autocast, get_loss_scaler, save_network_stats
         from util.util import log_cfg
         self.cfg = cfg
+        self.fold_context = fold_context
         self.device = torch.device('cuda', cfg.local_rank)
         self.master, self.logger, self.writer = cfg.master, cfg.logger, cfg.writer
         self.closed, self.recorders = False, {}
         self.training = cfg.mode in ('train', 'ft')
-        checkpoint = cfg.model.model_kwargs['checkpoint_path']
+        checkpoint = str(resume_checkpoint) if resume_checkpoint else cfg.model.model_kwargs['checkpoint_path']
         if not self.training and not checkpoint and not cfg.synthetic_smoke:
             raise ValueError('Independent evaluation requires an explicit checkpoint')
         state = torch.load(checkpoint, map_location='cpu') if checkpoint else {}
@@ -57,8 +58,11 @@ class FastCLSTrainer:
             raise ValueError('Synthetic and production checkpoints cannot be mixed')
         if checkpoint and 'class_to_idx' not in state:
             self._log('Legacy checkpoint: historical class mapping cannot be verified')
-        splits = ('train', 'val') if self.training else (cfg.mode,)
-        self.bundle = build_loaders(cfg, splits, state.get('class_to_idx'))
+        splits = ('train', 'val', 'test') if self.training else (cfg.mode,)
+        self.bundle = build_loaders(
+            cfg, splits, state.get('class_to_idx'),
+            getattr(cfg, 'fold_plan', None),
+            fold_context.validation_fold if fold_context else None)
         self.net = get_model(cfg.model).to(self.device).eval()
         if self.master:
             model_stat_path = Path(cfg.logdir) / 'model_stat.txt'
@@ -142,11 +146,15 @@ class FastCLSTrainer:
             if self.iter % cfg.data.train_size:
                 raise ValueError('Resume requires a complete epoch boundary with compatible loader size')
         self._log('pipeline_version=1; synthetic_smoke={}; logs flush at global period OR epoch end; train_reset_log_per does not clear metrics'.format(cfg.synthetic_smoke))
+        if self.fold_context is not None:
+            from .folds import format_fold_split
+            self._log(format_fold_split(self.fold_context))
         log_cfg(cfg)
 
     def _log(self, message):
         if self.master:
-            self.logger.info(message)
+            prefix = '[Fold {}/{}] '.format(self.fold_context.fold_index, self.fold_context.fold_count) if self.fold_context else ''
+            self.logger.info(prefix + message)
 
     def _log_training_modules(self):
         model_kwargs = self.cfg.model.model_kwargs
@@ -178,7 +186,7 @@ class FastCLSTrainer:
             self.epoch += 1
             self.record_metrics('train', 'net', self.epoch, {k: v['mean'] for k, v in result.losses.items()})
             self._log('Epoch {}: samples={}, seconds={:.3f}, images/s={:.3f}'.format(self.epoch, result.samples, result.seconds, result.samples / result.seconds))
-            if self.epoch >= self.cfg.trainer.test_start_epoch or self.epoch % self.cfg.trainer.test_per_epoch == 0:
+            if True:
                 for name, net in (('net', self.net), ('net_E', self.net_E)):
                     if net is None:
                         continue
@@ -207,6 +215,27 @@ class FastCLSTrainer:
             self._log_training_time(time.perf_counter() - self.cfg.task_start_time)
             self.save_checkpoint()
         self._log(self.best_metrics.summary_log(self.best_checkpoint))
+        if self.best_checkpoint is None or not Path(self.best_checkpoint).is_file():
+            raise RuntimeError('Training completed without a best validation checkpoint')
+        from .cross_validation import TrainingResult
+        return TrainingResult(self.best_metrics.top1, self.best_metrics.top5,
+                              self.best_metrics.epoch, self.best_checkpoint,
+                              self.epoch, time.perf_counter() - self.cfg.task_start_time)
+
+    def evaluate_best_on_test(self, best_checkpoint):
+        state = torch.load(best_checkpoint, map_location='cpu')
+        if self.fold_context is not None:
+            if state.get('validation_fold') != self.fold_context.validation_fold:
+                raise ValueError('Best checkpoint belongs to a different fold')
+            if state.get('plan_digest') != self.fold_context.plan_digest or state.get('config_digest') != self.fold_context.config_digest:
+                raise ValueError('Best checkpoint fold fingerprint mismatch')
+        from util.net import trans_state_dict
+        target = self.net.module if self.cfg.dist else self.net
+        target.load_state_dict(state['net'], strict=self.cfg.model.model_kwargs['strict'])
+        result = self.evaluate('test', self.net)
+        self.record_metrics('test', 'net', self.epoch, {'CE': result.loss},
+                            {'top1': result.top1, 'top5': result.top5})
+        return result
 
     def check_bn(self):
         # The original model hook is optional; inspect its declared class API only.
@@ -337,7 +366,15 @@ class FastCLSTrainer:
             return
         from trainer.loss_recorder import LossRecorder
         prefix = split.capitalize()
-        self._log('{} ({}) epoch {}: losses={}, scores={}'.format(prefix, model_name, epoch, losses, scores))
+        if scores is None:
+            score_log = 'None'
+        else:
+            score_log = '{' + ', '.join(
+                '{}: {}'.format(repr(name), format(value, '.3f')
+                                if name in ('top1', 'top5') else repr(value))
+                for name, value in scores.items()) + '}'
+        self._log('{} ({}) epoch {}: losses={}, scores={}'.format(
+            prefix, model_name, epoch, losses, score_log))
         if all(value is not None and math.isfinite(value) for value in losses.values()):
             suffix = '_ema' if model_name == 'net_E' else ''
             key = split + '_loss' + suffix
@@ -369,6 +406,11 @@ class FastCLSTrainer:
                      class_to_idx=self.bundle.class_to_idx, synthetic_smoke=self.cfg.synthetic_smoke,
                      legacy_topk_recorder=self.legacy_topk_recorder,
                      **self.best_metrics.checkpoint_fields())
+        if self.fold_context is not None:
+            state.update(validation_fold=self.fold_context.validation_fold,
+                         fold_index=self.fold_context.fold_index,
+                         plan_digest=self.fold_context.plan_digest,
+                         config_digest=self.fold_context.config_digest)
         root = Path(self.cfg.logdir)
         path = root / 'latest_ckpt.pth'
         torch.save(state, path)

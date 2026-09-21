@@ -13,7 +13,7 @@ test_start_epoch = 400
 batch_size = 200
 lr = 1.5e-4
 weight_decay = 0.05
-nb_classes = 100
+nb_classes = 20
 
 ft = False
 if ft:

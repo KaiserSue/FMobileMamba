@@ -1,5 +1,6 @@
 """Requested split construction; no implicit production-data fallback."""
 from dataclasses import dataclass
+from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
@@ -9,6 +10,37 @@ class LoaderBundle:
     loaders: dict
     lengths: dict
     class_to_idx: dict
+    sample_ids: dict
+
+
+class FoldSubsetDataset(Dataset):
+    """An exact, ordered sample view over an ImageFolder-style dataset."""
+    def __init__(self, dataset, sample_ids, dataset_root):
+        requested = set(sample_ids)
+        if not requested:
+            raise ValueError('Fold sample IDs must be nonempty')
+        root = Path(dataset_root).resolve()
+        index_by_id = {}
+        for index, (path, _) in enumerate(dataset.samples):
+            sample_id = Path(path).resolve().relative_to(root).as_posix()
+            if sample_id in index_by_id:
+                raise ValueError('Duplicate dataset sample ID: ' + sample_id)
+            index_by_id[sample_id] = index
+        unknown = requested - set(index_by_id)
+        if unknown:
+            raise ValueError('Unknown fold sample IDs: ' + ', '.join(sorted(unknown)[:5]))
+        self.dataset = dataset
+        self.indices = tuple(index for sample_id, index in index_by_id.items() if sample_id in requested)
+        self.sample_ids = tuple(Path(dataset.samples[index][0]).resolve().relative_to(root).as_posix()
+                                for index in self.indices)
+        self.samples = tuple(dataset.samples[index] for index in self.indices)
+        self.class_to_idx = dict(dataset.class_to_idx)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.dataset[self.indices[index]]
 
 
 class SyntheticDataset(Dataset):
@@ -47,10 +79,11 @@ class MaskedEvalDataset(Dataset):
         return dict(self.dataset[index if valid else 0], valid=valid)
 
 
-def build_loaders(cfg, requested_splits, expected_class_to_idx=None):
+def build_loaders(cfg, requested_splits, expected_class_to_idx=None,
+                  fold_plan=None, validation_fold=None):
     if not requested_splits or len(set(requested_splits)) != len(requested_splits):
         raise ValueError('Request distinct, nonempty splits')
-    loaders, lengths = {}, {}
+    loaders, lengths, sample_ids = {}, {}, {}
     mapping = expected_class_to_idx
     td = cfg.trainer.data
     for split in requested_splits:
@@ -65,7 +98,17 @@ def build_loaders(cfg, requested_splits, expected_class_to_idx=None):
             from data.CLS_dataset import DefaultCLS
             from data.utils import get_transforms
             transform = get_transforms(cfg, train, cfg.data.train_transforms if train else cfg.data.test_transforms)
-            dataset = DefaultCLS(cfg, train=train, transform=transform, subset=vars(cfg.data)[split + '_subdir'])
+            physical_split = 'train' if fold_plan is not None and split in ('train', 'val') else split
+            dataset = DefaultCLS(cfg, train=physical_split == 'train', transform=transform,
+                                 subset=vars(cfg.data)[physical_split + '_subdir'])
+            if split in ('train', 'val') and fold_plan is not None:
+                if validation_fold is None:
+                    raise ValueError('validation_fold is required with a fold plan')
+                from pathlib import Path
+                from .folds import fold_sample_ids
+                train_ids, val_ids = fold_sample_ids(fold_plan, validation_fold)
+                selected = train_ids if split == 'train' else val_ids
+                dataset = FoldSubsetDataset(dataset, selected, Path(cfg.data.root_dir))
         if not len(dataset):
             raise ValueError('Empty split: ' + split)
         if len(dataset.class_to_idx) != cfg.data.nb_classes or sorted(dataset.class_to_idx.values()) != list(range(cfg.data.nb_classes)):
@@ -74,6 +117,7 @@ def build_loaders(cfg, requested_splits, expected_class_to_idx=None):
             raise ValueError('Class mapping mismatch in ' + split)
         mapping = dict(dataset.class_to_idx)
         lengths[split] = len(dataset)
+        sample_ids[split] = tuple(getattr(dataset, 'sample_ids', ()))
         if not train:
             dataset = MaskedEvalDataset(dataset, cfg.world_size)
         sampler = None
@@ -96,4 +140,4 @@ def build_loaders(cfg, requested_splits, expected_class_to_idx=None):
         if len(loader) == 0:
             raise ValueError('Zero batches for split ' + split + '; reduce batch size or disable drop_last')
         loaders[split] = loader
-    return LoaderBundle(loaders, lengths, mapping)
+    return LoaderBundle(loaders, lengths, mapping, sample_ids)

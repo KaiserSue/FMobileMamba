@@ -57,7 +57,7 @@ class BestValidationMetrics:
         if self.top1 is None or self.top5 is None or self.epoch is None:
             raise RuntimeError('Best validation metrics are unavailable')
         return (
-            'Val best: current_top1={}, best_top1={}, top5_at_best={}, '
+            'Val best: current_top1={:.3f}, best_top1={:.3f}, top5_at_best={:.3f}, '
             'best_epoch={}, improved={}'
         ).format(current_top1, self.top1, self.top5, self.epoch, improved)
 
@@ -67,7 +67,7 @@ class BestValidationMetrics:
         if self.top5 is None or self.epoch is None:
             raise RuntimeError('Best validation metrics are incomplete')
         return (
-            'Training summary: best_val_top1={}, top5_at_best={}, '
+            'Training summary: best_val_top1={:.3f}, top5_at_best={:.3f}, '
             'best_epoch={}, best_checkpoint={}'
         ).format(self.top1, self.top5, self.epoch,
                  best_checkpoint or 'unavailable')

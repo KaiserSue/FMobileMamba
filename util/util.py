@@ -52,7 +52,7 @@ def makedirs(dirs, exist_ok=False):
 		os.makedirs(dir, exist_ok=exist_ok)
 	
 	
-def init_checkpoint(cfg):
+def init_checkpoint(cfg, datefmt=None):
 
 	def rm_zero_size_file(path):
 			files = os.listdir(path)
@@ -84,19 +84,20 @@ def init_checkpoint(cfg):
 		cfg.trainer.iter, cfg.trainer.epoch = 0, 0
 		cfg.trainer.topk_recorder = dict()
 		cfg.trainer.topk_recorder = dict(net_top1=[], net_top5=[], net_E_top1=[], net_E_top5=[])
-	cfg.logger = get_logger(cfg) if cfg.master else None
+	cfg.logger = get_logger(cfg, datefmt=datefmt) if cfg.master else None
 	cfg.writer = SummaryWriter(log_dir=cfg.logdir, comment='') if cfg.master else None
 	log_msg(cfg.logger, f'==> Logging on master GPU: {cfg.logger_rank}')
 	# rm_zero_size_file(cfg.logdir) if cfg.master else None
 
 
 def log_cfg(cfg):
-	
+	runtime_fields = {'fold_plan', 'fold_context'}
+
 	def _parse_Namespace(cfg, base_str=''):
 		ret = {}
 		if hasattr(cfg, '__dict__'):
 			for key, val in cfg.__dict__.items():
-				if not key.startswith('_'):
+				if not key.startswith('_') and key not in runtime_fields:
 					ret.update(_parse_Namespace(val, '{}.{}'.format(base_str, key).lstrip('.')))
 		else:
 			ret.update({base_str:cfg})
@@ -124,11 +125,11 @@ def log_cfg(cfg):
 	log_msg(cfg.logger, f'==> ********** cfg ********** \n{cfg.cfg_str}')
 
 
-def get_logger(cfg, mode='a+'):
+def get_logger(cfg, mode='a+', datefmt=None):
 	log_format = '%(asctime)s - %(message)s'
-	logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
+	logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt=datefmt or '%m/%d %I:%M:%S %p')
 	fh = logging.FileHandler('{}/log_{}.txt'.format(cfg.logdir, cfg.mode), mode=mode)
-	fh.setFormatter(logging.Formatter(log_format))
+	fh.setFormatter(logging.Formatter(log_format, datefmt=datefmt))
 	logger = logging.getLogger()
 	logger.addHandler(fh)
 	cfg.logger = logger

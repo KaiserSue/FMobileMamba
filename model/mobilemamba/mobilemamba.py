@@ -695,6 +695,7 @@ CFG_MobileMamba_T4 = {
         'depth': [1, 2, 2],
         'global_ratio': [0.8, 0.7, 0.6],
         'local_ratio': [0.2, 0.2, 0.3],
+        'kernels_padding': [[11,5], [7,3], [5,2]],
         'kernels': [7, 5, 3],
         'drop_path': 0,
         'ssm_ratio': 2,

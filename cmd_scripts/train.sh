@@ -4,24 +4,23 @@ set -euo pipefail
 CONDA_ENV="${CONDA_ENV:-MobileMamba}"
 GLOBAL_MODE="${GLOBAL_MODE:-fft}"
 LOCAL_MODE="${LOCAL_MODE:-layeroperator}"
-CFG_PATH="${CFG_PATH:-configs/mobilemamba/mobilemamba_b1.py}"
+CFG_PATH="${CFG_PATH:-configs/mobilemamba/mobilemamba_t2.py}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 SEED="${SEED:-42}"
 IMAGE_SIZE="${IMAGE_SIZE:-192}"
-EPOCH_FULL="${EPOCH_FULL:-600}"
-WARMUP_EPOCHS="${WARMUP_EPOCHS:-30}"
-TEST_START_EPOCH="${TEST_START_EPOCH:-500}"
+EPOCH_FULL="${EPOCH_FULL:-300}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-200}"
 LEARNING_RATE="${LEARNING_RATE:-1.5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.05}"
 NB_CLASSES="${NB_CLASSES:-20}"
 FT="${FT:-false}"
 SAVE_PER_EPOCH="${SAVE_PER_EPOCH:-20}"
-TEST_PER_EPOCH="${TEST_PER_EPOCH:-5}"
 NUM_WORKERS_PER_GPU="${NUM_WORKERS_PER_GPU:-8}"
-CHECKPOINT_ROOT="${CHECKPOINT_ROOT-runs/mobilemamba/500_epochs_fmobilemamba_b1/fast_pipeline}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT-runs/mobilemamba/500_epochs_fmobilemamba_t2_new/fast_pipeline}"
 RESUME_DIR="${RESUME_DIR:-}"
+DATA_ROOT="${DATA_ROOT:-}"
 CONDA_BIN="${CONDA_BIN:-${CONDA_EXE:-conda}}"
 
 die() {
@@ -36,11 +35,11 @@ validate_launcher_params() {
     case "$FT" in true|false) ;; *) die 'FT must be true or false' ;; esac
 
     local name value
-    for name in NPROC_PER_NODE IMAGE_SIZE EPOCH_FULL BATCH_SIZE NB_CLASSES SAVE_PER_EPOCH TEST_PER_EPOCH; do
+    for name in NPROC_PER_NODE IMAGE_SIZE EPOCH_FULL BATCH_SIZE NB_CLASSES SAVE_PER_EPOCH; do
         value="${!name}"
         [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
     done
-    for name in SEED WARMUP_EPOCHS TEST_START_EPOCH NUM_WORKERS_PER_GPU; do
+    for name in SEED WARMUP_EPOCHS NUM_WORKERS_PER_GPU; do
         value="${!name}"
         [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a nonnegative integer"
     done
@@ -65,20 +64,23 @@ build_config_overrides() {
         "shared.size=$IMAGE_SIZE"
         "shared.epoch_full=$EPOCH_FULL"
         "shared.warmup_epochs=$WARMUP_EPOCHS"
-        "shared.test_start_epoch=$TEST_START_EPOCH"
         "shared.batch_size=$BATCH_SIZE"
         "shared.lr=$LEARNING_RATE"
         "shared.weight_decay=$WEIGHT_DECAY"
         "shared.nb_classes=$NB_CLASSES"
         "shared.ft=$FT"
         "trainer.save_per_epoch=$SAVE_PER_EPOCH"
-        "trainer.test_per_epoch=$TEST_PER_EPOCH"
         "trainer.data.num_workers_per_gpu=$NUM_WORKERS_PER_GPU"
         "trainer.checkpoint=$CHECKPOINT_ROOT"
         "trainer.resume_dir=$RESUME_DIR"
+        "trainer.num_folds=5"
+        "trainer.fold_order=('E','A','B','C','D')"
         "model.model_kwargs.global_mode=$GLOBAL_MODE"
         "model.model_kwargs.local_mode=$LOCAL_MODE"
     )
+    if [[ -n "$DATA_ROOT" ]]; then
+        script_opts+=("data.root_dir=$DATA_ROOT" "data.root=$DATA_ROOT")
+    fi
 }
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$SCRIPT_DIR/.."

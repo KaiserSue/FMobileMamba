@@ -148,6 +148,9 @@ def load_config(args, project_root):
     cfg.mode = 'test' if cfg.mode == 'test_net' else cfg.mode
     cfg.ft = cfg.mode == 'ft'
     cfg.trainer.name = 'FastCLSTrainer'
+    cfg.trainer.num_folds = 5
+    cfg.trainer.fold_order = ('E', 'A', 'B', 'C', 'D')
+    cfg.trainer.fold_plan_path = ''
     cfg.model.model_kwargs.setdefault('global_mode', 'fft')
     cfg.model.model_kwargs.setdefault('local_mode', 'layeroperator')
     cfg.trainer.iter_full = None
@@ -200,12 +203,15 @@ def validate_config(cfg):
     for name, value in (
             ('size', cfg.size), ('data.nb_classes', cfg.data.nb_classes),
             ('logging.train_log_per', cfg.logging.train_log_per),
-            ('trainer.test_per_epoch', cfg.trainer.test_per_epoch),
             ('trainer.save_per_epoch', cfg.trainer.save_per_epoch)):
         if type(value) is not int or value <= 0:
             raise ValueError(name + ' must be a positive integer')
     if type(cfg.seed) is not int or cfg.seed < 0:
         raise ValueError('seed must be a nonnegative integer')
+    if cfg.mode in ('train', 'ft') and (cfg.trainer.num_folds != 5 or tuple(cfg.trainer.fold_order) != ('E', 'A', 'B', 'C', 'D')):
+        raise ValueError('Five-fold training requires num_folds=5 and fold_order=E,A,B,C,D')
+    if not isinstance(cfg.trainer.fold_plan_path, str):
+        raise ValueError('trainer.fold_plan_path must be a string')
     if type(cfg.trainer.test_start_epoch) is not int or cfg.trainer.test_start_epoch < 0:
         raise ValueError('trainer.test_start_epoch must be a nonnegative integer')
     for name in ('persistent_workers', 'pin_memory', 'non_blocking', 'drop_last'):

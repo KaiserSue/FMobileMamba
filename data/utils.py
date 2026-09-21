@@ -10,11 +10,10 @@ def get_transforms(cfg, train, cfg_transforms):
 		t_type = t.pop('type')
 		t_tran = TRANSFORMS.get_module(t_type)(**t)
 		transform_list.extend(t_tran) if isinstance(t_tran, list) else transform_list.append(t_tran)
-	transform_out = TRANSFORMS.get_module('Compose')(transform_list)
-	
 	if train:
 		if cfg.size <= 32:
-			transform_out[0] = transforms.RandomCrop(cfg.size, padding=4)
+			transform_list[0] = transforms.RandomCrop(cfg.size, padding=4)
+	transform_out = TRANSFORMS.get_module('Compose')(transform_list)
 	return transform_out
 
 

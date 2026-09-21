@@ -148,7 +148,8 @@ def set_requires_grad(model, requires_grad=False):
 		p.requires_grad = requires_grad
 
 
-def print_networks(models, size, logger):
+def get_network_stats(models, size):
+	results = []
 	for model in models:
 		result = '\n' + '-' * 36 + ' {} '.format(type(model).__name__) + '-' * 36 + '\n'
 		# total_num_params = 0
@@ -164,7 +165,23 @@ def print_networks(models, size, logger):
 		flops = FlopCountAnalysis(model, torch.randn([1, 3, size, size], dtype=list(model.parameters())[0].dtype, device=list(model.parameters())[0].device))
 		result += '{}\n'.format(flop_count_table(flops, max_depth=5))
 		result += '-' * (72 + 2 + len(type(model).__name__))
-		log_msg(logger, result)
+		results.append(result)
+	return '\n'.join(results)
+
+
+def save_network_stats(models, size, output_path):
+	result = get_network_stats(models, size)
+	note = ('FLOPs are reported by fvcore FlopCountAnalysis with one fused '
+			'multiply-add counted as one operation. Unsupported custom operators '
+			'may be omitted.')
+	with open(output_path, 'w', encoding='utf-8') as file:
+		file.write(result)
+		file.write('\n\nNote: {}\n'.format(note))
+
+
+def print_networks(models, size, logger):
+	log_msg(logger, get_network_stats(models, size))
+
 
 def reduce_tensor(tensor, world_size, mode='sum', sum_avg=True, rank=0):
 	if isinstance(tensor, torch.Tensor):
@@ -248,5 +265,3 @@ def get_net_params(net, requires_grad=True):
 		if requires_grad and param.requires_grad:
 			num_params += param.numel()
 	return num_params
-
-
