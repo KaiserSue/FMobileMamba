@@ -43,7 +43,6 @@ class FastCLSTrainer:
         from optim import get_optim
         from optim.scheduler import get_scheduler
         from util.net import get_autocast, get_loss_scaler, save_network_stats
-        from util.util import log_cfg
         self.cfg = cfg
         self.fold_context = fold_context
         self.device = torch.device('cuda', cfg.local_rank)
@@ -149,7 +148,6 @@ class FastCLSTrainer:
         if self.fold_context is not None:
             from .folds import format_fold_split
             self._log(format_fold_split(self.fold_context))
-        log_cfg(cfg)
 
     def _log(self, message):
         if self.master:

@@ -60,11 +60,35 @@ class CrossValidationSummary:
         return value
 
 
+def format_cross_validation_summary(summary):
+    lines = ["Five-fold test summary:"]
+    for result in summary.fold_results:
+        lines.append(
+            "  Fold {} ({}): Top-1={:.3f}%, Top-5={:.3f}%, samples={}, checkpoint={}".format(
+                result.fold_index,
+                result.validation_fold,
+                result.test_top1,
+                result.test_top5,
+                result.test_samples,
+                result.best_checkpoint,
+            )
+        )
+    lines.extend((
+        "  Mean: Top-1={:.3f}%, Top-5={:.3f}%".format(
+            summary.mean_top1, summary.mean_top5),
+        "  Total fold time: {:.3f}s".format(summary.total_duration_seconds),
+        "  Summary JSON: {}".format(Path(summary.run_dir) / "summary.json"),
+    ))
+    return "\n".join(lines)
+
+
 class CrossValidationRunner:
     def __init__(self, cfg, trainer_factory=None, config_fingerprint=None):
         self.cfg = cfg
         self.master = cfg.master
         self.trainer_factory = trainer_factory
+        self._active_logger = getattr(cfg, "logger", None)
+        self._configuration_logged = False
         self.config_snapshot, self.config_digest = (config_fingerprint or build_config_fingerprint(cfg))
         resume = bool(cfg.trainer.resume_dir)
         if resume:
@@ -84,9 +108,14 @@ class CrossValidationRunner:
         self.resume = resume
 
     def _log(self, message):
-        logger = getattr(self.cfg, "logger", None)
-        if self.master and logger is not None:
-            logger.info(message)
+        if self.master and self._active_logger is not None:
+            self._active_logger.info(message)
+
+    def _log_configuration_once(self, cfg, log_configuration):
+        if not self.master or self._configuration_logged:
+            return
+        log_configuration(cfg)
+        self._configuration_logged = True
 
     def _fold_config(self, context, resume_checkpoint):
         cfg = copy.deepcopy(self.cfg)
@@ -106,6 +135,7 @@ class CrossValidationRunner:
         from util.util import get_logger
         cfg.logger = get_logger(cfg, datefmt="%Y-%m-%d %H:%M:%S")
         cfg.writer = SummaryWriter(log_dir=cfg.logdir, comment="")
+        self._active_logger = cfg.logger
         return cfg
 
     def _run_fold(self, index, validation_fold, plan, state):
@@ -123,7 +153,9 @@ class CrossValidationRunner:
         factory = self.trainer_factory
         if factory is None:
             from .trainer import FastCLSTrainer
+            from util.util import log_cfg
             factory = FastCLSTrainer
+            self._log_configuration_once(cfg, log_cfg)
         trainer = factory(cfg, context, resume_checkpoint)
         started = time.perf_counter()
         try:
@@ -194,8 +226,9 @@ class CrossValidationRunner:
             state["active_fold"] = None
             if self.master:
                 save_run_state(state_path, state)
-            self._log("Five-fold training completed in {:.3f}s: test top1={:.3f}, top5={:.3f}".format(
-                time.perf_counter() - started, summary.mean_top1, summary.mean_top5))
+            self._log(format_cross_validation_summary(summary))
+            self._log("Five-fold training completed in {:.3f}s".format(
+                time.perf_counter() - started))
             return summary
         except BaseException as error:
             state["status"] = "failed"
