@@ -2,6 +2,9 @@
 import json
 import math
 import os
+import ctypes
+import ctypes.util
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -34,6 +37,7 @@ class DeviceIdentity:
     gpu_name: str
     gpu_uuid: str = None
     pci_bus_id: str = None
+    mapping_error: str = None
 
 
 @dataclass(frozen=True)
@@ -68,9 +72,10 @@ def append_record(logdir, record):
 def format_device_group(identities):
     rows = ['[GPU monitor {}] device confirmation; CUDA indices are process-visible, not physical GPU indices'.format(_now())]
     for item in sorted(identities, key=lambda entry: entry.rank):
-        rows.append('rank={} local_rank={} device={} visible_cuda={} name={} UUID={} PCI={}'.format(
+        rows.append('rank={} local_rank={} device={} visible_cuda={} name={} UUID={} PCI={} mapping_error={}'.format(
             item.rank, item.local_rank, item.device_type, item.cuda_visible_index,
-            item.gpu_name, item.gpu_uuid or 'unavailable', item.pci_bus_id or 'unavailable'))
+            item.gpu_name, item.gpu_uuid or 'unavailable', item.pci_bus_id or 'unavailable',
+            item.mapping_error or '-'))
     return '\n'.join(rows)
 
 
@@ -123,6 +128,46 @@ def format_periodic_group(record):
     return '\n'.join(rows)
 
 
+def _cuda_pci_bus_id(cuda_index):
+    import torch
+
+    cuda_version = torch.version.cuda
+    if not cuda_version:
+        raise RuntimeError('CUDA Runtime version is unavailable')
+    major = cuda_version.split('.')[0]
+    soname = 'libcudart.so.{}.0'.format(major) if major == '11' else 'libcudart.so.{}'.format(major)
+    site_packages = Path(torch.__file__).resolve().parent.parent
+    candidates = [site_packages / 'nvidia' / 'cuda_runtime' / 'lib' / soname,
+                  Path(sys.prefix) / 'lib' / soname,
+                  Path(torch.__file__).resolve().parent / 'lib' / soname]
+    discovered = ctypes.util.find_library('cudart')
+    if discovered:
+        candidates.append(discovered)
+    candidates.append(soname)
+    library = None
+    errors = []
+    for candidate in candidates:
+        try:
+            library = ctypes.CDLL(str(candidate))
+            break
+        except OSError as error:
+            errors.append('{}: {}'.format(candidate, error))
+    if library is None:
+        raise RuntimeError('CUDA Runtime library {} unavailable; {}'.format(soname, '; '.join(errors)))
+
+    get_pci = library.cudaDeviceGetPCIBusId
+    get_pci.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+    get_pci.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(32)
+    result = get_pci(buffer, len(buffer), cuda_index)
+    if result != 0:
+        raise RuntimeError('cudaDeviceGetPCIBusId failed for visible cuda:{} with CUDA error {}'.format(
+            cuda_index, result))
+    if not buffer.value:
+        raise RuntimeError('cudaDeviceGetPCIBusId returned an empty PCI bus ID for visible cuda:{}'.format(cuda_index))
+    return buffer.value.decode('ascii')
+
+
 def _nvml_device(cuda_index):
     import torch
     import pynvml
@@ -130,13 +175,7 @@ def _nvml_device(cuda_index):
     uuid = getattr(props, 'uuid', None)
     pci = getattr(props, 'pci_bus_id', None)
     if not pci:
-        import ctypes
-        buffer = ctypes.create_string_buffer(32)
-        result = torch.cuda.cudart().cudaDeviceGetPCIBusId(buffer, len(buffer), cuda_index)
-        if result == 0:
-            pci = buffer.value.decode()
-    if not uuid and not pci:
-        raise RuntimeError('PyTorch exposes no CUDA UUID or PCI bus ID for safe NVML mapping')
+        pci = _cuda_pci_bus_id(cuda_index)
     matches = []
     for index in range(pynvml.nvmlDeviceGetCount()):
         handle = pynvml.nvmlDeviceGetHandleByIndex(index)
@@ -146,7 +185,7 @@ def _nvml_device(cuda_index):
             nv_uuid = nv_uuid.decode()
         if isinstance(nv_pci, bytes):
             nv_pci = nv_pci.decode()
-        if (uuid and str(uuid) == nv_uuid) or (pci and str(pci).lower() == nv_pci.lower()):
+        if (not uuid or str(uuid) == nv_uuid) and str(pci).lower() == nv_pci.lower():
             matches.append((handle, nv_uuid, nv_pci))
     if len(matches) != 1:
         raise RuntimeError('CUDA to NVML device mapping is missing or ambiguous')
@@ -160,7 +199,7 @@ def describe_device(rank, local_rank, model_parameter_device):
         return DeviceIdentity(rank, local_rank, device.type, -1, 'unavailable')
     index = device.index if device.index is not None else torch.cuda.current_device()
     name = torch.cuda.get_device_name(index)
-    uuid = pci = None
+    uuid = pci = mapping_error = None
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -168,9 +207,9 @@ def describe_device(rank, local_rank, model_parameter_device):
             _, uuid, pci = _nvml_device(index)
         finally:
             pynvml.nvmlShutdown()
-    except (ImportError, RuntimeError, OSError, AttributeError):
-        pass  # Optional identifiers never hide the PyTorch-confirmed device.
-    return DeviceIdentity(rank, local_rank, device.type, index, name, uuid, pci)
+    except (ImportError, RuntimeError, OSError, AttributeError) as error:
+        mapping_error = str(error)
+    return DeviceIdentity(rank, local_rank, device.type, index, name, uuid, pci, mapping_error)
 
 
 class GpuMonitor:
