@@ -3,6 +3,7 @@ import copy
 import datetime
 import math
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,9 @@ from timm.utils import dispatch_clip_grad
 from .best_metrics import BestValidationMetrics
 from .data import build_loaders
 from .metrics import DeviceMetrics
+from .gpu_monitor import (MonitorConfig, append_record, create_monitor, describe_device,
+                          format_device_group, format_epoch_group, format_periodic_group,
+                          read_periodic_group)
 
 
 @dataclass
@@ -144,6 +148,24 @@ class FastCLSTrainer:
                 self._log('Legacy test history retained separately; val best selection starts fresh')
             if self.iter % cfg.data.train_size:
                 raise ValueError('Resume requires a complete epoch boundary with compatible loader size')
+        self.gpu_monitor = None
+        if self.training:
+            settings = cfg.trainer.gpu_monitor
+            monitor_config = MonitorConfig(settings.enabled, settings.sample_interval_seconds,
+                                           settings.report_interval_seconds)
+            self.gpu_monitor = create_monitor(cfg.local_rank, cfg.rank, monitor_config, cfg.logdir)
+            parameter_device = next(self.net.parameters()).device
+            identity = describe_device(cfg.rank, cfg.local_rank, parameter_device)
+            identities = [None] * cfg.world_size
+            if cfg.dist:
+                dist.all_gather_object(identities, identity)
+            else:
+                identities[0] = identity
+            if self.master:
+                self._gpu_record(format_device_group(identities))
+                if self.gpu_monitor.status != 'ok':
+                    self._gpu_record('[GPU monitor] sampling {}: {}'.format(
+                        self.gpu_monitor.status, self.gpu_monitor.error))
         self._log('pipeline_version=1; synthetic_smoke={}; logs flush at global period OR epoch end; train_reset_log_per does not clear metrics'.format(cfg.synthetic_smoke))
         if self.fold_context is not None:
             from .folds import format_fold_split
@@ -153,6 +175,23 @@ class FastCLSTrainer:
         if self.master:
             prefix = '[Fold {}/{}] '.format(self.fold_context.fold_index, self.fold_context.fold_count) if self.fold_context else ''
             self.logger.info(prefix + message)
+
+    def _gpu_record(self, record):
+        self._log(record)
+        try:
+            append_record(self.cfg.logdir, record)
+        except OSError as error:
+            self._log('GPU monitor file write failed: {}'.format(error))
+
+    def _gpu_report_loop(self, epoch_number, stop_event):
+        interval = self.gpu_monitor.config.report_interval_seconds
+        while not stop_event.wait(interval):
+            try:
+                group = read_periodic_group(epoch_number, datetime.datetime.now(datetime.timezone.utc),
+                                            self.cfg.world_size, self.cfg.logdir, interval)
+                self._gpu_record(format_periodic_group(group))
+            except (OSError, ValueError) as error:
+                self._log('GPU monitor periodic report unavailable: {}'.format(error))
 
     def _log_training_modules(self):
         model_kwargs = self.cfg.model.model_kwargs
@@ -251,27 +290,50 @@ class FastCLSTrainer:
         torch.cuda.synchronize(self.device)
         start = time.perf_counter()
         totals, samples = {}, 0
-        for index, batch in enumerate(loader):
-            self.scheduler.step(self.iter)
-            losses = self.train_step(self.transfer_batch(batch))
-            self.iter += 1
-            samples += batch['img'].shape[0] * self.cfg.world_size
-            self.metrics.update(losses, {name: torch.ones((), device=self.device) for name in losses})
-            last = index + 1 == len(loader) or self.iter >= self.cfg.trainer.iter_full
-            if self.iter % self.cfg.logging.train_log_per == 0 or last:
-                snapshot = self.metrics.flush()
-                for name, metric in snapshot.items():
-                    total = totals.setdefault(name, {'sum': 0., 'count': 0.})
-                    total['sum'] += metric['sum']
-                    total['count'] += metric['count']
-                    total['mean'] = total['sum'] / total['count']
-                self._log('Train iter {}: {}'.format(self.iter, snapshot))
-                if self.master:
+        epoch_number = self.epoch + 1
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self.gpu_monitor.start_epoch(epoch_number)
+        report_stop = threading.Event()
+        report_thread = None
+        if self.master:
+            report_thread = threading.Thread(target=self._gpu_report_loop,
+                                             args=(epoch_number, report_stop), daemon=True)
+            report_thread.start()
+        try:
+            for index, batch in enumerate(loader):
+                self.scheduler.step(self.iter)
+                losses = self.train_step(self.transfer_batch(batch))
+                self.iter += 1
+                self.gpu_monitor.publish_progress(self.iter, torch.cuda.max_memory_allocated(self.device))
+                samples += batch['img'].shape[0] * self.cfg.world_size
+                self.metrics.update(losses, {name: torch.ones((), device=self.device) for name in losses})
+                last = index + 1 == len(loader) or self.iter >= self.cfg.trainer.iter_full
+                if self.iter % self.cfg.logging.train_log_per == 0 or last:
+                    snapshot = self.metrics.flush()
                     for name, metric in snapshot.items():
-                        self.writer.add_scalar('Train/window_' + name, metric['mean'], self.iter)
-                    self.writer.add_scalar('Train/lr', self.optim.param_groups[0]['lr'], self.iter)
-            if last:
-                break
+                        total = totals.setdefault(name, {'sum': 0., 'count': 0.})
+                        total['sum'] += metric['sum']
+                        total['count'] += metric['count']
+                        total['mean'] = total['sum'] / total['count']
+                    self._log('Train iter {}: {}'.format(self.iter, snapshot))
+                    if self.master:
+                        for name, metric in snapshot.items():
+                            self.writer.add_scalar('Train/window_' + name, metric['mean'], self.iter)
+                        self.writer.add_scalar('Train/lr', self.optim.param_groups[0]['lr'], self.iter)
+                if last:
+                    break
+        finally:
+            report_stop.set()
+            if report_thread is not None:
+                report_thread.join()
+            rank_stats = self.gpu_monitor.stop_epoch(torch.cuda.max_memory_allocated(self.device))
+        all_stats = [None] * self.cfg.world_size
+        if self.cfg.dist:
+            dist.all_gather_object(all_stats, rank_stats)
+        else:
+            all_stats[0] = rank_stats
+        if self.master:
+            self._gpu_record(format_epoch_group(epoch_number, all_stats))
         if self.cfg.dist and self.dist_BN:
             distribute_bn(self.net, self.cfg.world_size, self.dist_BN)
             if self.net_E is not None:
@@ -428,6 +490,8 @@ class FastCLSTrainer:
         if self.closed:
             return
         self.closed = True
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.close()
         self.bundle.loaders.clear()
         if self.master:
             try:

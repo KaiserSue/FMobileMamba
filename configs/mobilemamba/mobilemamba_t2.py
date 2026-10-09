@@ -54,6 +54,7 @@ optim.optim_kwargs = dict(name='adamw', betas=(0.9, 0.999), eps=1e-8, weight_dec
 # =========> trainer <=================================
 trainer = _Namespace()
 trainer.name = 'CLSTrainer'
+trainer.gpu_monitor = _Namespace(enabled=True, sample_interval_seconds=0.5, report_interval_seconds=30.0)
 trainer.checkpoint = 'runs/mobilemamba/500_epochs_mobilemamba'
 trainer.resume_dir = ''
 trainer.cuda_deterministic = False

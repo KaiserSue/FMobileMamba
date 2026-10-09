@@ -148,6 +148,8 @@ def load_config(args, project_root):
     cfg.mode = 'test' if cfg.mode == 'test_net' else cfg.mode
     cfg.ft = cfg.mode == 'ft'
     cfg.trainer.name = 'FastCLSTrainer'
+    if not hasattr(cfg.trainer, 'gpu_monitor'):
+        cfg.trainer.gpu_monitor = Namespace(enabled=True, sample_interval_seconds=0.5, report_interval_seconds=30.0)
     cfg.trainer.num_folds = 5
     cfg.trainer.fold_order = ('E', 'A', 'B', 'C', 'D')
     cfg.trainer.fold_plan_path = ''
@@ -190,6 +192,9 @@ def load_config(args, project_root):
 
 
 def validate_config(cfg):
+    from .gpu_monitor import MonitorConfig
+    monitor = cfg.trainer.gpu_monitor
+    MonitorConfig(monitor.enabled, monitor.sample_interval_seconds, monitor.report_interval_seconds)
     if cfg.mode not in ('train', 'ft', 'val', 'test'):
         raise ValueError('Unsupported mode: ' + cfg.mode)
     td = cfg.trainer.data
