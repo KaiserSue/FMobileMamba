@@ -1,6 +1,7 @@
 import glob
 import importlib
 import inspect
+from data.split_selection import select_eval_subdir
 import torch
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -50,6 +51,8 @@ def get_dataset(cfg):
 	train_transforms = get_transforms(cfg, train=True, cfg_transforms=cfg.data.train_transforms)
 	eval_transforms = get_transforms(cfg, train=False, cfg_transforms=cfg.data.test_transforms)
 	root_dir, train_subdir, val_subdir, test_subdir = _get_split_dirs(cfg)
+	if cfg.data.type == 'DefaultCLS':
+		test_subdir = select_eval_subdir(root_dir, test_subdir, val_subdir)
 	cfg.data.root_dir = root_dir
 	cfg.data.train_subdir, cfg.data.val_subdir, cfg.data.test_subdir = train_subdir, val_subdir, test_subdir
 	train_set = _build_dataset(cfg, train=True, transform=train_transforms, subset=train_subdir)
