@@ -1,7 +1,8 @@
 import glob
 import importlib
 import inspect
-from data.split_selection import select_eval_subdir
+import os
+from data.split_selection import require_val_subdir, select_test_subdir
 import torch
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
@@ -52,12 +53,36 @@ def get_dataset(cfg):
 	eval_transforms = get_transforms(cfg, train=False, cfg_transforms=cfg.data.test_transforms)
 	root_dir, train_subdir, val_subdir, test_subdir = _get_split_dirs(cfg)
 	if cfg.data.type == 'DefaultCLS':
-		test_subdir = select_eval_subdir(root_dir, test_subdir, val_subdir)
-	cfg.data.root_dir = root_dir
-	cfg.data.train_subdir, cfg.data.val_subdir, cfg.data.test_subdir = train_subdir, val_subdir, test_subdir
+		cfg.data.root_dir = root_dir
+		cfg.data.train_subdir, cfg.data.val_subdir, cfg.data.test_subdir = train_subdir, val_subdir, test_subdir
 	train_set = _build_dataset(cfg, train=True, transform=train_transforms, subset=train_subdir)
-	test_set = _build_dataset(cfg, train=False, transform=eval_transforms, subset=test_subdir)
+	if cfg.data.type == 'DefaultCLS' and cfg.mode in ('train', 'ft'):
+		require_val_subdir(root_dir, val_subdir)
+		test_set = _build_labeled_val_dataset(cfg, train_set, eval_transforms, val_subdir)
+	elif cfg.data.type == 'DefaultCLS':
+		selected = select_test_subdir(root_dir, test_subdir, val_subdir)
+		test_set = _build_dataset(cfg, train=False, transform=eval_transforms, subset=selected)
+	else:
+		test_set = _build_dataset(cfg, train=False, transform=eval_transforms, subset=test_subdir)
 	return train_set, test_set
+
+
+def _build_labeled_val_dataset(cfg, train_set, transform, val_subdir):
+	from data.CLS_dataset import AnnotatedValCLS
+	root_dir = cfg.data.root_dir
+	val_root = os.path.join(root_dir, val_subdir)
+	annotation_file = os.path.join(val_root, 'val_annotations.txt')
+	if os.path.exists(annotation_file):
+		val_set = AnnotatedValCLS(val_root, train_set.class_to_idx, cfg.data.loader_type, transform)
+	else:
+		val_set = _build_dataset(cfg, train=False, transform=transform, subset=val_subdir)
+	if len(train_set.class_to_idx) != cfg.data.nb_classes:
+		raise ValueError(f'Training class count {len(train_set.class_to_idx)} does not match configured {cfg.data.nb_classes}')
+	if val_set.class_to_idx != train_set.class_to_idx:
+		raise ValueError(f'Validation class mapping differs from training: {val_root}')
+	if len(val_set) == 0:
+		raise ValueError(f'Validation set has no samples: {val_root}')
+	return val_set
 
 
 def get_loader(cfg):

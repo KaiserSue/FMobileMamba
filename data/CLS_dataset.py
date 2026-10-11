@@ -67,6 +67,58 @@ class DefaultCLS(datasets.folder.DatasetFolder):  # ImageNet
 		return {'img': img, 'target': target}
 
 
+class AnnotatedValCLS(data.Dataset):
+	"""Tiny ImageNet validation images labeled by val_annotations.txt."""
+	def __init__(self, root, class_to_idx, loader_type, transform):
+		self.root = os.fspath(root)
+		self.annotation_file = os.path.join(self.root, 'val_annotations.txt')
+		self.images_dir = os.path.join(self.root, 'images')
+		if not os.path.isfile(self.annotation_file):
+			raise FileNotFoundError(f'Validation annotations are missing: {self.annotation_file}')
+		if not os.path.isdir(self.images_dir):
+			raise NotADirectoryError(f'Validation images directory is missing: {self.images_dir}')
+		self.class_to_idx = dict(class_to_idx)
+		if sorted(self.class_to_idx.values()) != list(range(len(self.class_to_idx))):
+			raise ValueError('Training class indices must be unique and consecutive')
+		self.classes = [name for name, _ in sorted(self.class_to_idx.items(), key=lambda item: item[1])]
+		self.loader = get_img_loader(loader_type)
+		self.transform = transform
+		annotations = {}
+		with open(self.annotation_file, encoding='utf-8') as source:
+			for line_number, line in enumerate(source, 1):
+				columns = line.strip().split()
+				if len(columns) < 2:
+					raise ValueError(f'Malformed validation annotation at line {line_number}: {self.annotation_file}')
+				filename, category = columns[:2]
+				if filename in ('.', '..') or os.path.basename(filename) != filename or '\\' in filename:
+					raise ValueError(f'Invalid validation image name at line {line_number}: {filename}')
+				if filename in annotations:
+					raise ValueError(f'Duplicate validation annotation: {filename}')
+				if category not in self.class_to_idx:
+					raise ValueError(f'Unknown validation category at line {line_number}: {category}')
+				annotations[filename] = self.class_to_idx[category]
+		image_names = {name for name in os.listdir(self.images_dir)
+		               if os.path.isfile(os.path.join(self.images_dir, name))
+		               and name.lower().endswith(IMG_EXTENSIONS)}
+		if not image_names:
+			raise ValueError(f'Validation images directory has no supported images: {self.images_dir}')
+		if set(annotations) != image_names:
+			missing = sorted(image_names - set(annotations))
+			extra = sorted(set(annotations) - image_names)
+			raise ValueError(f'Validation image/annotation mismatch: missing={missing}, extra={extra}')
+		self.samples = [(os.path.abspath(os.path.join(self.images_dir, name)), annotations[name])
+		                for name in sorted(image_names)]
+
+	def __len__(self):
+		return len(self.samples)
+
+	def __getitem__(self, index):
+		path, target = self.samples[index]
+		img = self.loader(path)
+		img = self.transform(img) if self.transform is not None else img
+		return {'img': img, 'target': target}
+
+
 class INatDataset(ImageFolder):
 	def __init__(self, root, train=True, transform=None, year=2018):
 		super(INatDataset, self).__init__(root=root)

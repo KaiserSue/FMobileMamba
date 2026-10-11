@@ -1,8 +1,18 @@
 import os
 
 
-def select_eval_subdir(root_dir, test_subdir, val_subdir):
-	"""Select the evaluation directory, preferring an existing test split."""
+def require_val_subdir(root_dir, val_subdir):
+	"""Require a validation directory for training-time evaluation."""
+	path = os.path.join(root_dir, val_subdir)
+	if os.path.isdir(path):
+		return val_subdir
+	if os.path.exists(path):
+		raise NotADirectoryError(f'Validation split path is not a directory: {path}')
+	raise FileNotFoundError(f'Validation split directory does not exist: {path}')
+
+
+def select_test_subdir(root_dir, test_subdir, val_subdir):
+	"""Select the explicit test directory, preserving the test-first rule."""
 	for subdir in (test_subdir, val_subdir):
 		path = os.path.join(root_dir, subdir)
 		if os.path.isdir(path):

@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRAIN_SCRIPT = PROJECT_ROOT / 'cmd_scripts' / 'train_native.sh'
-EXPECTED_CLASSES = 200
 # 直接运行本文件时使用的参数。数据在其他位置时，只需修改这里。
 DATA_ROOT = None  # None 表示使用 train_native.sh 生效配置中的数据根目录。
 REPORT_PATH = PROJECT_ROOT / 'tmp' / 'native_dataloader_audit.txt'
@@ -29,6 +28,7 @@ class LoaderAudit:
     classes: List[str]
     class_to_idx: Dict[str, int]
     sample_examples: List[Tuple[str, int]]
+    label_source: str
     image_shape: Optional[Tuple[int, ...]] = None
     target_shape: Optional[Tuple[int, ...]] = None
     target_min_max: Optional[Tuple[int, int]] = None
@@ -95,12 +95,15 @@ def load_native_config(data_root):
 
 
 def _inspect_loader(loader, role):
+    from data.CLS_dataset import AnnotatedValCLS
     dataset = loader.dataset
     audit = LoaderAudit(
         role=role, source_dir=Path(dataset.root).resolve(),
         sample_count=len(dataset), batch_count=len(loader),
         classes=list(dataset.classes), class_to_idx=dict(dataset.class_to_idx),
         sample_examples=[(str(path), int(label)) for path, label in dataset.samples[:5]],
+        label_source=str(dataset.annotation_file) if isinstance(dataset, AnnotatedValCLS)
+                     else '类别目录',
     )
     if audit.batch_count == 0:
         audit.error = 'DataLoader 没有可读取的 batch；请检查样本数、batch size 和 drop_last'
@@ -123,23 +126,17 @@ def audit_loaders(cfg, data_root):
     """Build both native loaders and inspect their actual first batches."""
     result = AuditResult(data_root=data_root, configured_class_count=cfg.data.nb_classes)
     from data import get_loader
-    configured_test_dir = (data_root / cfg.data.test_subdir).resolve()
     val_dir = (data_root / cfg.data.val_subdir).resolve()
-    selected_dir = configured_test_dir if configured_test_dir.is_dir() else val_dir
-    result.selected_eval_split = selected_dir.name
+    result.selected_eval_split = cfg.data.val_subdir
     try:
         train_loader, eval_loader = get_loader(cfg)
     except Exception as error:
         result.findings.append('DataLoader 构建失败: {}: {}'.format(type(error).__name__, error))
-        if selected_dir == configured_test_dir and val_dir.is_dir():
-            result.findings.append('当前代码优先选中了无法构建的 test/；val/ 存在，请核查 test/ 标签结构或改用 val/')
         return result
     result.train = _inspect_loader(train_loader, 'train')
     result.eval = _inspect_loader(eval_loader, 'eval')
     expected_train = (data_root / cfg.data.train_subdir).resolve()
-    expected_eval = selected_dir
-    if result.configured_class_count != EXPECTED_CLASSES:
-        result.findings.append('生效配置类别数为 {}，预期为 200'.format(result.configured_class_count))
+    expected_eval = val_dir
     if result.train.source_dir != expected_train:
         result.findings.append('训练 loader 来源不符: 预期 {}，实际 {}'.format(expected_train, result.train.source_dir))
     if result.eval.source_dir != expected_eval:
@@ -147,18 +144,14 @@ def audit_loaders(cfg, data_root):
     for item in (result.train, result.eval):
         if item.sample_count == 0:
             result.findings.append('{} 样本数为 0'.format(item.role))
-        if len(item.class_to_idx) != EXPECTED_CLASSES:
-            result.findings.append('{} 类别数为 {}，预期为 200'.format(item.role, len(item.class_to_idx)))
+        if len(item.class_to_idx) != result.configured_class_count:
+            result.findings.append('{} 类别数为 {}，预期为 {}'.format(item.role, len(item.class_to_idx), result.configured_class_count))
         if item.error:
             result.findings.append('{} {}'.format(item.role, item.error))
-        if item.target_min_max and (item.target_min_max[0] < 0 or item.target_min_max[1] >= EXPECTED_CLASSES):
-            result.findings.append('{} 首批标签超出 [0, 199]: {}'.format(item.role, item.target_min_max))
+        if item.target_min_max and (item.target_min_max[0] < 0 or item.target_min_max[1] >= result.configured_class_count):
+            result.findings.append('{} 首批标签超出 [0, {}]: {}'.format(item.role, result.configured_class_count - 1, item.target_min_max))
     if result.train.class_to_idx != result.eval.class_to_idx:
         result.findings.append('训练与评估类别映射不一致')
-    if (result.eval.source_dir == configured_test_dir and val_dir.is_dir()
-            and (len(result.eval.class_to_idx) != EXPECTED_CLASSES
-                 or result.train.class_to_idx != result.eval.class_to_idx)):
-        result.findings.append('当前代码优先选中了有问题的 test/；val/ 存在，请核查 test/ 标签结构或改用 val/')
     if not result.findings:
         result.status = 'PASS'
     return result
@@ -188,6 +181,7 @@ def format_report(result):
             '样本数: {}'.format(item.sample_count),
             'batch 数: {}'.format(item.batch_count),
             '类别数: {}'.format(len(item.classes)),
+            '标签来源: {}'.format(item.label_source),
             '完整类别映射:',
         ])
         lines.extend('  {} -> {}'.format(name, index) for name, index in sorted(item.class_to_idx.items(), key=lambda pair: pair[1]))
