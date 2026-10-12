@@ -22,7 +22,7 @@ class SpectralBottleneckFFTConvLayer(nn.Module):
         super().__init__()
         reduced = in_channel // 2
         self.pre = nn.Sequential(
-            nn.Conv2d(in_channel, reduced, kernel_size=1),
+            nn.Conv2d(in_channel, reduced, kernel_size=1, groups=reduced),
             nn.BatchNorm2d(reduced),
             nn.ReLU(inplace=True),
         )
@@ -31,9 +31,8 @@ class SpectralBottleneckFFTConvLayer(nn.Module):
             nn.Conv2d(in_channel, in_channel, kernel_size=1),
             nn.BatchNorm2d(in_channel),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channel, in_channel, kernel_size=1),
         )
-        self.post = nn.Conv2d(reduced, in_channel, kernel_size=1)
+        self.post = nn.Conv2d(reduced, in_channel, kernel_size=1, groups=reduced)
 
     def forward(self, x):
         return self.post(self.spectral(self.pre(x)))
