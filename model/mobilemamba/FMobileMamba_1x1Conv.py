@@ -1,4 +1,4 @@
-"""T2 MobileMamba with a channel-mixing spectral bottleneck."""
+"""T2 MobileMamba with a channel-reduced FFT branch."""
 
 import torch.nn as nn
 
@@ -13,22 +13,30 @@ from model.mobilemamba.mobilemamba import (
 )
 
 
-class SpectralBottleneckFFTConvLayer(FFTConvLayer):
-    """Apply 1x1, depthwise 3x3, 1x1 to stacked real and imaginary spectra."""
+class SpectralBottleneckFFTConvLayer(nn.Module):
+    """Reduce channels around the FFT and mix real/imaginary spectra."""
 
     def __init__(self, in_channel):
         if type(in_channel) is not int or in_channel < 2 or in_channel % 2:
             raise ValueError("FFT input channels must be an even integer >= 2")
-        super().__init__(in_channel)
-        middle = in_channel // 2
-        self.conv = nn.Sequential(
-            nn.Conv2d(2 * in_channel, middle, kernel_size=1),
-            nn.BatchNorm2d(middle),
+        super().__init__()
+        reduced = in_channel // 2
+        self.pre = nn.Sequential(
+            nn.Conv2d(in_channel, reduced, kernel_size=1),
+            nn.BatchNorm2d(reduced),
             nn.ReLU(inplace=True),
-            nn.Conv2d(middle, middle, kernel_size=3, padding=1, groups=middle),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(middle, 2 * in_channel, kernel_size=1),
         )
+        self.spectral = FFTConvLayer(reduced)
+        self.spectral.conv = nn.Sequential(
+            nn.Conv2d(in_channel, in_channel, kernel_size=1),
+            nn.BatchNorm2d(in_channel),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channel, in_channel, kernel_size=1),
+        )
+        self.post = nn.Conv2d(reduced, in_channel, kernel_size=1)
+
+    def forward(self, x):
+        return self.post(self.spectral(self.pre(x)))
 
 
 class FMobileMamba1x1ConvModel(MobileMamba):
