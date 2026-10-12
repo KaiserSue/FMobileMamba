@@ -82,7 +82,7 @@ trainer.data.pin_memory = True
 trainer.data.persistent_workers = False
 
 trainer.mixup_kwargs = dict(
-	mixup_alpha=0, cutmix_alpha=1.0, cutmix_minmax=None, prob=1, switch_prob=0,
+	mixup_alpha=0.5, cutmix_alpha=0.5, cutmix_minmax=None, prob=1, switch_prob=0.5,
 	mode='batch', correct_lam=True, label_smoothing=0.1, num_classes=data.nb_classes)
 
 trainer.scale_kwargs = dict(n_scale=0, base_h=size, base_w=size, min_h=160, max_h=320, min_w=160, max_w=320, check_scale_div_factor=32)

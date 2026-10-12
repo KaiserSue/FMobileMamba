@@ -105,6 +105,9 @@ opts=(
     "model.name=FMobileMamba_1x1Conv_T2"
     "model.model_kwargs.num_classes=$nb_classes"
     "trainer.mixup_kwargs.num_classes=$nb_classes"
+    "trainer.mixup_kwargs.mixup_alpha=0.5"
+    "trainer.mixup_kwargs.cutmix_alpha=0.5"
+    "trainer.mixup_kwargs.switch_prob=0.5"
     "model.model_kwargs.global_mode=$global_mode"
     "model.model_kwargs.local_mode=$local_mode"
 )
