@@ -1,5 +1,6 @@
-"""MobileMamba experiments with selectable depthwise spectral kernels."""
+"""MobileMamba experiments with selectable spectral and local kernels."""
 
+import torch
 import torch.nn as nn
 
 from model import MODEL
@@ -11,11 +12,104 @@ from model.mobilemamba.mobilemamba import (
     CFG_MobileMamba_T2,
     CFG_MobileMamba_T4,
     FFTConvLayer,
+    LayerNorm,
     MBFFTConv2d,
     MobileMamba,
+    MobileMambaModule,
     normalize_global_mode,
     replace_batchnorm,
 )
+
+
+def _resolve_local_kernel_paddings(local_kernel_set):
+    kernel_sets = {
+        "original": ((11, 5), (7, 3), (5, 2)),
+        "reduced": ((9, 4), (7, 3), (5, 2)),
+    }
+    if type(local_kernel_set) is not str or local_kernel_set not in kernel_sets:
+        raise ValueError("local_kernel_set must be 'original' or 'reduced'")
+    return kernel_sets[local_kernel_set]
+
+
+def _load_cuda_dcnv3():
+    from pkg_resources import DistributionNotFound
+
+    try:
+        from model.ops_dcnv3.modules import DCNv3
+    except (ImportError, ModuleNotFoundError, DistributionNotFound) as error:
+        raise RuntimeError(
+            "CUDA DCNv3 is unavailable; compile and install model/ops_dcnv3 "
+            "with the selected Python environment before building local_branch_new"
+        ) from error
+    return DCNv3
+
+
+class LocalBranchNew(nn.Module):
+    """Large-kernel local branch paired with a channel-wise CUDA DCNv3 branch."""
+
+    def __init__(self, in_channel, kernel_padding):
+        if type(in_channel) is not int or in_channel < 2:
+            raise ValueError("in_channel must be an integer >= 2")
+        if (not isinstance(kernel_padding, (tuple, list))
+                or len(kernel_padding) != 2
+                or any(type(value) is not int for value in kernel_padding)
+                or kernel_padding[0] <= 0
+                or kernel_padding[0] % 2 != 1
+                or kernel_padding[1] != kernel_padding[0] // 2):
+            raise ValueError(
+                "kernel_padding must contain an odd positive kernel and "
+                "size-preserving padding"
+            )
+        super().__init__()
+        big_channels = in_channel // 2
+        small_channels = in_channel - big_channels
+        self.in_channel = in_channel
+        self.split_channels = (big_channels, small_channels)
+        self.kernel = kernel_padding[0]
+        self.padding = kernel_padding[1]
+        self.norm1 = LayerNorm(
+            in_channel, eps=1e-6, data_format="channels_first"
+        )
+        self.big_conv = nn.Sequential(
+            nn.Conv2d(big_channels, big_channels, 1),
+            nn.GELU(),
+            nn.Conv2d(
+                big_channels,
+                big_channels,
+                kernel_size=self.kernel,
+                stride=1,
+                padding=self.padding,
+                dilation=1,
+                groups=big_channels,
+            ),
+        )
+        self.conv1x1_1 = nn.Conv2d(big_channels, big_channels, 1)
+        self.conv1x1_2 = nn.Conv2d(big_channels, big_channels, 1)
+        self.conv1x1_3 = nn.Conv2d(small_channels, small_channels, 1)
+        dcnv3 = _load_cuda_dcnv3()
+        self.small_conv = dcnv3(
+            channels=small_channels,
+            kernel_size=3,
+            dw_kernel_size=3,
+            stride=1,
+            pad=1,
+            dilation=1,
+            group=small_channels,
+        )
+
+    def forward(self, x):
+        normalized = self.norm1(x)
+        big_input, small_input = torch.split(
+            normalized, self.split_channels, dim=1
+        )
+        big_output = self.conv1x1_2(
+            self.big_conv(big_input) + self.conv1x1_1(big_input)
+        )
+        small_nchw = self.conv1x1_3(small_input)
+        small_nhwc = small_nchw.permute(0, 2, 3, 1).contiguous()
+        small_output = self.small_conv(small_nhwc)
+        small_output = small_output.permute(0, 3, 1, 2).contiguous()
+        return torch.cat((big_output, small_output), dim=1)
 
 
 class SpectralExperimentFFTConvLayer(nn.Module):
@@ -43,7 +137,8 @@ class SpectralExperimentFFTConvLayer(nn.Module):
 class FMobileMambaExperimentModel(MobileMamba):
     """Install a specified FFT kernel in every configured model stage."""
 
-    def __init__(self, fft_kernel_size=3, **model_options):
+    def __init__(self, fft_kernel_size=3, local_kernel_set="reduced",
+                 **model_options):
         if type(fft_kernel_size) is int and fft_kernel_size in (3, 5, 7):
             stage_kernel_sizes = (fft_kernel_size,) * 3
         elif type(fft_kernel_size) is str and fft_kernel_size == "k":
@@ -56,8 +151,21 @@ class FMobileMambaExperimentModel(MobileMamba):
         if (len(stage_depths) != 3
                 or any(type(depth) is not int or depth <= 0 for depth in stage_depths)):
             raise ValueError("model depth must contain three positive integers")
+        stage_local_kernels = _resolve_local_kernel_paddings(local_kernel_set)
+        requested_local_mode = model_options.get("local_mode", "layeroperator")
+        if requested_local_mode not in (
+                "layeroperator", "dwconv", "local_branch_new"):
+            raise ValueError(
+                "local_mode must be layeroperator, dwconv, or local_branch_new"
+            )
+        if requested_local_mode == "local_branch_new":
+            model_options["local_mode"] = "layeroperator"
+            model_options["kernels_padding"] = stage_local_kernels
         model_options["global_mode"] = "fft"
         super().__init__(**model_options)
+
+        if requested_local_mode == "local_branch_new":
+            self._install_local_branch_new(stage_local_kernels, stage_depths)
 
         for stage, kernel_size, expected_count in zip(
                 (self.blocks1, self.blocks2, self.blocks3),
@@ -72,9 +180,39 @@ class FMobileMambaExperimentModel(MobileMamba):
                 module.fft_conv = SpectralExperimentFFTConvLayer(
                     module.in_channels, kernel_size)
 
+    def _install_local_branch_new(self, stage_kernel_paddings, stage_depths):
+        replacements = []
+        for stage_index, (stage, kernel_padding, expected_count) in enumerate(zip(
+                (self.blocks1, self.blocks2, self.blocks3),
+                stage_kernel_paddings,
+                stage_depths), start=1):
+            local_nodes = [
+                module for module in stage.modules()
+                if isinstance(module, MobileMambaModule)
+            ]
+            if len(local_nodes) != expected_count:
+                raise RuntimeError(
+                    f"local branch stage {stage_index} structure mismatch: "
+                    f"expected {expected_count} nodes, found {len(local_nodes)}"
+                )
+            for module in local_nodes:
+                if type(module.local_channels) is not int or module.local_channels <= 0:
+                    raise RuntimeError(
+                        f"local branch stage {stage_index} has invalid channel count: "
+                        f"{module.local_channels}"
+                    )
+                replacements.append((
+                    module,
+                    LocalBranchNew(module.local_channels, kernel_padding),
+                ))
+
+        for module, local_op in replacements:
+            module.local_op = local_op
+
 
 def _build_fmobilemamba_experiment(num_classes, distillation, fuse, model_cfg,
-                                   global_mode, local_mode, fft_kernel_size):
+                                   global_mode, local_mode, fft_kernel_size,
+                                   local_kernel_set):
     if global_mode is not None and normalize_global_mode(global_mode) != "fft":
         raise ValueError("FMobileMamba_experiment only supports FFT mode")
     options = dict(model_cfg)
@@ -82,7 +220,8 @@ def _build_fmobilemamba_experiment(num_classes, distillation, fuse, model_cfg,
     if local_mode is not None:
         options["local_mode"] = local_mode
     model = FMobileMambaExperimentModel(
-        fft_kernel_size=fft_kernel_size, num_classes=num_classes,
+        fft_kernel_size=fft_kernel_size, local_kernel_set=local_kernel_set,
+        num_classes=num_classes,
         distillation=distillation, **options)
     if fuse:
         replace_batchnorm(model)
@@ -93,57 +232,63 @@ def _build_fmobilemamba_experiment(num_classes, distillation, fuse, model_cfg,
 def FMobileMamba_experiment_T2(num_classes=1000, pretrained=False,
                                distillation=False, fuse=False, pretrained_cfg=None,
                                model_cfg=CFG_MobileMamba_T2, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+                               local_mode=None, fft_kernel_size=3,
+                               local_kernel_set="reduced"):
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
-        fft_kernel_size)
+        fft_kernel_size, local_kernel_set)
 
 
 @MODEL.register_module
 def FMobileMamba_experiment_T4(num_classes=1000, pretrained=False,
                                distillation=False, fuse=False, pretrained_cfg=None,
                                model_cfg=CFG_MobileMamba_T4, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+                               local_mode=None, fft_kernel_size=3,
+                               local_kernel_set="reduced"):
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
-        fft_kernel_size)
+        fft_kernel_size, local_kernel_set)
 
 
 @MODEL.register_module
 def FMobileMamba_experiment_S6(num_classes=1000, pretrained=False,
                                distillation=False, fuse=False, pretrained_cfg=None,
                                model_cfg=CFG_MobileMamba_S6, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+                               local_mode=None, fft_kernel_size=3,
+                               local_kernel_set="reduced"):
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
-        fft_kernel_size)
+        fft_kernel_size, local_kernel_set)
 
 
 @MODEL.register_module
 def FMobileMamba_experiment_B1(num_classes=1000, pretrained=False,
                                distillation=False, fuse=False, pretrained_cfg=None,
                                model_cfg=CFG_MobileMamba_B1, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+                               local_mode=None, fft_kernel_size=3,
+                               local_kernel_set="reduced"):
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
-        fft_kernel_size)
+        fft_kernel_size, local_kernel_set)
 
 
 @MODEL.register_module
 def FMobileMamba_experiment_B2(num_classes=1000, pretrained=False,
                                distillation=False, fuse=False, pretrained_cfg=None,
                                model_cfg=CFG_MobileMamba_B2, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+                               local_mode=None, fft_kernel_size=3,
+                               local_kernel_set="reduced"):
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
-        fft_kernel_size)
+        fft_kernel_size, local_kernel_set)
 
 
 @MODEL.register_module
 def FMobileMamba_experiment_B4(num_classes=1000, pretrained=False,
                                distillation=False, fuse=False, pretrained_cfg=None,
                                model_cfg=CFG_MobileMamba_B4, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+                               local_mode=None, fft_kernel_size=3,
+                               local_kernel_set="reduced"):
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
-        fft_kernel_size)
+        fft_kernel_size, local_kernel_set)

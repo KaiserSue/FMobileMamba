@@ -10,6 +10,8 @@ nproc_per_node="${NPROC_PER_NODE:-1}"
 master_port="${MASTER_PORT:-29500}"
 global_mode="${GLOBAL_MODE:-fft}"
 local_mode="${LOCAL_MODE:-dwconv}"
+local_kernel_set="${LOCAL_KERNEL_SET:-reduced}"
+force_dcnv3_rebuild="${FORCE_DCNV3_REBUILD:-false}"
 fft_kernel_size="${FFT_KERNEL_SIZE:-3}"
 seed="${SEED:-42}"
 epoch_full="${EPOCH_FULL:-500}"
@@ -46,7 +48,7 @@ case "$model_variant" in
     *) echo 'MODEL_VARIANT must be T2, T4, S6, B1, B2, or B4' >&2; exit 2 ;;
 esac
 model_name="FMobileMamba_experiment_${model_variant}"
-checkpoint_root="${CHECKPOINT_ROOT:-runs/mobilemamba/${model_name}_${fft_kernel_size}}"
+checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet/300epochs_b1_wt_dwconv_${fft_kernel_size}}"
 
 dry_run=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -72,7 +74,10 @@ if [[ ! "$master_port" =~ ^[0-9]+$ ]] || (( 10#$master_port < 1 || 10#$master_po
 fi
 [[ "${global_mode,,}" == fft ]] || { echo 'GLOBAL_MODE must be fft' >&2; exit 2; }
 global_mode=fft
-case "$local_mode" in layeroperator|dwconv) ;; *) echo 'LOCAL_MODE must be layeroperator or dwconv' >&2; exit 2 ;; esac
+case "$local_mode" in layeroperator|dwconv|local_branch_new) ;; *) echo 'LOCAL_MODE must be layeroperator, dwconv, or local_branch_new' >&2; exit 2 ;; esac
+case "$local_kernel_set" in original|reduced) ;; *) echo 'LOCAL_KERNEL_SET must be original or reduced' >&2; exit 2 ;; esac
+force_dcnv3_rebuild="${force_dcnv3_rebuild,,}"
+case "$force_dcnv3_rebuild" in true|false) ;; *) echo 'FORCE_DCNV3_REBUILD must be true or false' >&2; exit 2 ;; esac
 case "$fft_kernel_size" in 3|5|7|k) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, or k' >&2; exit 2 ;; esac
 ft="${ft,,}"
 case "$ft" in true|false) ;; *) echo 'FT must be true or false' >&2; exit 2 ;; esac
@@ -94,7 +99,7 @@ for opt in "$@"; do
     fi
     key="${opt%%=*}"
     case "$key" in
-        model|model.name|model.model_kwargs|model.model_kwargs.global_mode|model.model_kwargs.fft_kernel_size|nb_classes|data|data.nb_classes|trainer|trainer.mixup_kwargs|trainer.mixup_kwargs.num_classes|model.model_kwargs.num_classes)
+        model|model.name|model.model_kwargs|model.model_kwargs.global_mode|model.model_kwargs.local_mode|model.model_kwargs.local_kernel_set|model.model_kwargs.fft_kernel_size|nb_classes|data|data.nb_classes|trainer|trainer.mixup_kwargs|trainer.mixup_kwargs.num_classes|model.model_kwargs.num_classes)
             echo "Override is fixed for this model: $key" >&2
             exit 2
             ;;
@@ -135,6 +140,9 @@ opts=(
     "model.model_kwargs.global_mode=$global_mode"
     "model.model_kwargs.local_mode=$local_mode"
 )
+if [[ "$local_mode" == local_branch_new ]]; then
+    opts+=("model.model_kwargs.local_kernel_set=$local_kernel_set")
+fi
 if [[ -n "$data_root" ]]; then
     opts+=("data.root_dir=$data_root" "data.root=$data_root")
 fi
@@ -150,6 +158,214 @@ if "$dry_run"; then
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0
+fi
+
+check_dcnv3_health() {
+    "$python_bin" - <<'PY'
+import importlib.metadata
+
+import torch
+import DCNv3
+from model.ops_dcnv3.modules import DCNv3 as DCNv3Module
+
+distribution = importlib.metadata.distribution("DCNv3")
+if distribution.version != "1.1":
+    raise RuntimeError(
+        f"expected DCNv3 distribution version 1.1, found {distribution.version}"
+    )
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is unavailable to PyTorch")
+
+device = torch.device("cuda", torch.cuda.current_device())
+module = DCNv3Module(
+    channels=16,
+    kernel_size=3,
+    dw_kernel_size=3,
+    stride=1,
+    pad=1,
+    dilation=1,
+    group=16,
+).to(device)
+input_tensor = torch.randn(1, 8, 8, 16, device=device)
+with torch.no_grad():
+    output = module(input_tensor)
+if tuple(output.shape) != (1, 8, 8, 16):
+    raise RuntimeError(f"unexpected DCNv3 output shape: {tuple(output.shape)}")
+print("DCNv3 CUDA health check passed with output shape [1, 8, 8, 16]")
+PY
+}
+
+collect_dcnv3_prerequisite_errors() {
+    local has_errors=false
+    if ! "$python_bin" - <<'PY'
+import importlib
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+required_packages = (
+    "torch",
+    "torchvision",
+    "setuptools",
+    "wheel",
+    "ninja",
+    "packaging",
+    "pip",
+)
+errors = []
+missing_packages = []
+loaded_packages = {}
+for package in required_packages:
+    if importlib.util.find_spec(package) is None:
+        missing_packages.append(package)
+        continue
+    try:
+        loaded_packages[package] = importlib.import_module(package)
+    except Exception as error:
+        errors.append(
+            f"[Python packages] cannot import {package}: "
+            f"{type(error).__name__}: {error}"
+        )
+if missing_packages:
+    errors.append(
+        "[Python packages] missing: " + ", ".join(missing_packages)
+    )
+
+torch = loaded_packages.get("torch")
+cuda_home = None
+if torch is not None:
+    if torch.version.cuda is None:
+        errors.append("[CUDA] PyTorch was built without CUDA support")
+    if not torch.cuda.is_available():
+        errors.append("[CUDA] torch.cuda.is_available() is false")
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+        cuda_home = CUDA_HOME
+    except Exception as error:
+        errors.append(
+            "[Python packages] cannot import torch CUDA build utilities: "
+            f"{type(error).__name__}: {error}"
+        )
+    if cuda_home is None:
+        errors.append("[CUDA] torch.utils.cpp_extension.CUDA_HOME is unset")
+
+nvcc_path = shutil.which("nvcc")
+if nvcc_path is None:
+    errors.append("[CUDA] nvcc is unavailable on PATH")
+if cuda_home is not None:
+    cuda_home_nvcc = str(cuda_home) + "/bin/nvcc"
+    if not os.path.isfile(cuda_home_nvcc) or not os.access(cuda_home_nvcc, os.X_OK):
+        errors.append(f"[CUDA] nvcc is unavailable at {cuda_home_nvcc}")
+if nvcc_path is not None and torch is not None:
+    completed = subprocess.run(
+        [nvcc_path, "--version"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if completed.returncode == 0:
+        match = re.search(r"release\s+(\d+\.\d+)", completed.stdout)
+        if match is None:
+            errors.append("[CUDA] could not parse nvcc version")
+        elif torch.version.cuda is not None:
+            torch_cuda = ".".join(torch.version.cuda.split(".")[:2])
+            if match.group(1) != torch_cuda:
+                errors.append(
+                    "[CUDA] PyTorch CUDA " + torch_cuda
+                    + " does not match nvcc " + match.group(1)
+                )
+    else:
+        errors.append(f"[CUDA] nvcc failed at {nvcc_path}")
+
+for error in errors:
+    print(error, file=sys.stderr)
+raise SystemExit(1 if errors else 0)
+PY
+    then
+        has_errors=true
+    fi
+
+    local tool
+    for tool in gcc g++ flock; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo "[Build tools] missing: $tool" >&2
+            has_errors=true
+        fi
+    done
+
+    local dcnv3_dir="$script_dir/../model/ops_dcnv3"
+    if [[ ! -f "$dcnv3_dir/setup.py" ]]; then
+        echo "[Source files] missing: $dcnv3_dir/setup.py" >&2
+        has_errors=true
+    fi
+    if [[ ! -d "$dcnv3_dir/src" || ! -d "$dcnv3_dir/src/cuda" ]]; then
+        echo "[Source files] missing DCNv3 src or src/cuda directory" >&2
+        has_errors=true
+    fi
+    if ! compgen -G "$dcnv3_dir/src/*.cpp" >/dev/null \
+            || ! compgen -G "$dcnv3_dir/src/cuda/*.cu" >/dev/null; then
+        echo "[Source files] missing DCNv3 C++ or CUDA sources" >&2
+        has_errors=true
+    fi
+
+    [[ "$has_errors" == false ]]
+}
+
+ensure_dcnv3_ready() {
+    local initial_health=false
+    if check_dcnv3_health; then
+        initial_health=true
+    fi
+    if [[ "$initial_health" == true && "$force_dcnv3_rebuild" == false ]]; then
+        echo "Reusing healthy CUDA DCNv3 installation"
+        return
+    fi
+
+    if ! collect_dcnv3_prerequisite_errors; then
+        echo "DCNv3 prerequisites are incomplete; training was not started" >&2
+        return 1
+    fi
+
+    local resolved_python
+    resolved_python="$("$python_bin" -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+    local environment_id
+    environment_id="$(printf '%s' "$resolved_python" | cksum | awk '{print $1}')"
+    local lock_file="/tmp/fmobilemamba_dcnv3_$(id -u)_${environment_id}.lock"
+    exec 9>"$lock_file"
+    flock 9
+
+    if [[ "$force_dcnv3_rebuild" == false ]] && check_dcnv3_health; then
+        echo "Reusing CUDA DCNv3 installed while waiting for the build lock"
+        flock -u 9
+        exec 9>&-
+        return
+    fi
+
+    local dcnv3_dir="$script_dir/../model/ops_dcnv3"
+    echo "Building CUDA DCNv3 from $dcnv3_dir with $resolved_python"
+    if ! "$python_bin" -m pip install --no-build-isolation --no-deps \
+            --force-reinstall --verbose "$dcnv3_dir"; then
+        echo "DCNv3 build and installation failed; training was not started" >&2
+        flock -u 9
+        exec 9>&-
+        return 1
+    fi
+    if ! check_dcnv3_health; then
+        echo "DCNv3 post-install CUDA health check failed; training was not started" >&2
+        flock -u 9
+        exec 9>&-
+        return 1
+    fi
+    flock -u 9
+    exec 9>&-
+}
+
+if [[ "$local_mode" == local_branch_new ]]; then
+    ensure_dcnv3_ready
 fi
 
 exec "${command[@]}"
