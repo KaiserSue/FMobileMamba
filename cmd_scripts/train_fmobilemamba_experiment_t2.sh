@@ -23,9 +23,30 @@ ft="${FT:-false}"
 save_per_epoch="${SAVE_PER_EPOCH:-20}"
 test_per_epoch="${TEST_PER_EPOCH:-5}"
 num_workers_per_gpu="${NUM_WORKERS_PER_GPU:-8}"
-checkpoint_root="${CHECKPOINT_ROOT:-runs/mobilemamba/FMobileMamba_experiment_T2_${fft_kernel_size}}"
 resume_dir="${RESUME_DIR:-}"
 data_root="${DATA_ROOT:-}"
+model_variant="${MODEL_VARIANT:-}"
+
+if [[ -z "$model_variant" ]]; then
+    cfg_filename="${cfg_path##*/}"
+    cfg_stem="${cfg_filename%.py}"
+    case "$cfg_stem" in
+        mobilemamba_t2|mobilemamba_t4|mobilemamba_s6|mobilemamba_b1|mobilemamba_b2|mobilemamba_b4)
+            model_variant="${cfg_stem#mobilemamba_}"
+            ;;
+        *)
+            echo "Cannot infer model variant from CFG_PATH; set MODEL_VARIANT to T2, T4, S6, B1, B2, or B4" >&2
+            exit 2
+            ;;
+    esac
+fi
+model_variant="${model_variant^^}"
+case "$model_variant" in
+    T2|T4|S6|B1|B2|B4) ;;
+    *) echo 'MODEL_VARIANT must be T2, T4, S6, B1, B2, or B4' >&2; exit 2 ;;
+esac
+model_name="FMobileMamba_experiment_${model_variant}"
+checkpoint_root="${CHECKPOINT_ROOT:-runs/mobilemamba/${model_name}_${fft_kernel_size}}"
 
 dry_run=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -104,7 +125,7 @@ opts=(
     "optim.lr=$learning_rate"
     "optim.optim_kwargs.weight_decay=$weight_decay"
     "data.nb_classes=$nb_classes"
-    "model.name=FMobileMamba_experiment_T2"
+    "model.name=$model_name"
     "model.model_kwargs.num_classes=$nb_classes"
     "model.model_kwargs.fft_kernel_size=$fft_kernel_size"
     "trainer.mixup_kwargs.num_classes=$nb_classes"

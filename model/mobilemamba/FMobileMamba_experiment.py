@@ -1,10 +1,15 @@
-"""T2 MobileMamba experiment with selectable depthwise spectral kernels."""
+"""MobileMamba experiments with selectable depthwise spectral kernels."""
 
 import torch.nn as nn
 
 from model import MODEL
 from model.mobilemamba.mobilemamba import (
+    CFG_MobileMamba_B1,
+    CFG_MobileMamba_B2,
+    CFG_MobileMamba_B4,
+    CFG_MobileMamba_S6,
     CFG_MobileMamba_T2,
+    CFG_MobileMamba_T4,
     FFTConvLayer,
     MBFFTConv2d,
     MobileMamba,
@@ -36,7 +41,7 @@ class SpectralExperimentFFTConvLayer(nn.Module):
 
 
 class FMobileMambaExperimentModel(MobileMamba):
-    """Install a specified FFT kernel in each T2 stage."""
+    """Install a specified FFT kernel in every configured model stage."""
 
     def __init__(self, fft_kernel_size=3, **model_options):
         if type(fft_kernel_size) is int and fft_kernel_size in (3, 5, 7):
@@ -47,30 +52,31 @@ class FMobileMambaExperimentModel(MobileMamba):
             raise ValueError("fft_kernel_size must be integer 3, 5, 7, or string 'k'")
         if normalize_global_mode(model_options.get("global_mode", "fft")) != "fft":
             raise ValueError("FMobileMamba_experiment only supports FFT mode")
+        stage_depths = tuple(model_options.get("depth", (1, 2, 2)))
+        if (len(stage_depths) != 3
+                or any(type(depth) is not int or depth <= 0 for depth in stage_depths)):
+            raise ValueError("model depth must contain three positive integers")
         model_options["global_mode"] = "fft"
         super().__init__(**model_options)
 
         for stage, kernel_size, expected_count in zip(
                 (self.blocks1, self.blocks2, self.blocks3),
-                stage_kernel_sizes, (1, 2, 2)):
+                stage_kernel_sizes, stage_depths):
             fft_nodes = [module for module in stage.modules()
                          if isinstance(module, MBFFTConv2d)]
             if len(fft_nodes) != expected_count:
                 raise RuntimeError(
-                    f"T2 FFT stage structure mismatch: expected {expected_count} nodes, "
+                    f"FFT stage structure mismatch: expected {expected_count} nodes, "
                     f"found {len(fft_nodes)}")
             for module in fft_nodes:
                 module.fft_conv = SpectralExperimentFFTConvLayer(
                     module.in_channels, kernel_size)
 
 
-@MODEL.register_module
-def FMobileMamba_experiment_T2(num_classes=1000, pretrained=False,
-                               distillation=False, fuse=False, pretrained_cfg=None,
-                               model_cfg=CFG_MobileMamba_T2, global_mode=None,
-                               local_mode=None, fft_kernel_size=3):
+def _build_fmobilemamba_experiment(num_classes, distillation, fuse, model_cfg,
+                                   global_mode, local_mode, fft_kernel_size):
     if global_mode is not None and normalize_global_mode(global_mode) != "fft":
-        raise ValueError("FMobileMamba_experiment_T2 only supports FFT mode")
+        raise ValueError("FMobileMamba_experiment only supports FFT mode")
     options = dict(model_cfg)
     options["global_mode"] = "fft"
     if local_mode is not None:
@@ -81,3 +87,63 @@ def FMobileMamba_experiment_T2(num_classes=1000, pretrained=False,
     if fuse:
         replace_batchnorm(model)
     return model
+
+
+@MODEL.register_module
+def FMobileMamba_experiment_T2(num_classes=1000, pretrained=False,
+                               distillation=False, fuse=False, pretrained_cfg=None,
+                               model_cfg=CFG_MobileMamba_T2, global_mode=None,
+                               local_mode=None, fft_kernel_size=3):
+    return _build_fmobilemamba_experiment(
+        num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
+        fft_kernel_size)
+
+
+@MODEL.register_module
+def FMobileMamba_experiment_T4(num_classes=1000, pretrained=False,
+                               distillation=False, fuse=False, pretrained_cfg=None,
+                               model_cfg=CFG_MobileMamba_T4, global_mode=None,
+                               local_mode=None, fft_kernel_size=3):
+    return _build_fmobilemamba_experiment(
+        num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
+        fft_kernel_size)
+
+
+@MODEL.register_module
+def FMobileMamba_experiment_S6(num_classes=1000, pretrained=False,
+                               distillation=False, fuse=False, pretrained_cfg=None,
+                               model_cfg=CFG_MobileMamba_S6, global_mode=None,
+                               local_mode=None, fft_kernel_size=3):
+    return _build_fmobilemamba_experiment(
+        num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
+        fft_kernel_size)
+
+
+@MODEL.register_module
+def FMobileMamba_experiment_B1(num_classes=1000, pretrained=False,
+                               distillation=False, fuse=False, pretrained_cfg=None,
+                               model_cfg=CFG_MobileMamba_B1, global_mode=None,
+                               local_mode=None, fft_kernel_size=3):
+    return _build_fmobilemamba_experiment(
+        num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
+        fft_kernel_size)
+
+
+@MODEL.register_module
+def FMobileMamba_experiment_B2(num_classes=1000, pretrained=False,
+                               distillation=False, fuse=False, pretrained_cfg=None,
+                               model_cfg=CFG_MobileMamba_B2, global_mode=None,
+                               local_mode=None, fft_kernel_size=3):
+    return _build_fmobilemamba_experiment(
+        num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
+        fft_kernel_size)
+
+
+@MODEL.register_module
+def FMobileMamba_experiment_B4(num_classes=1000, pretrained=False,
+                               distillation=False, fuse=False, pretrained_cfg=None,
+                               model_cfg=CFG_MobileMamba_B4, global_mode=None,
+                               local_mode=None, fft_kernel_size=3):
+    return _build_fmobilemamba_experiment(
+        num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
+        fft_kernel_size)
