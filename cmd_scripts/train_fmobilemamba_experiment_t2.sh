@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$script_dir/.."
+started_at="$(date +%m%d%H%M)"
 
 python_bin="${PYTHON_BIN:-python}"
 cfg_path="${CFG_PATH:-configs/mobilemamba/mobilemamba_t2.py}"
@@ -27,28 +28,56 @@ test_per_epoch="${TEST_PER_EPOCH:-5}"
 num_workers_per_gpu="${NUM_WORKERS_PER_GPU:-8}"
 resume_dir="${RESUME_DIR:-}"
 data_root="${DATA_ROOT:-}"
-model_variant="${MODEL_VARIANT:-}"
+checkpoint_root="${CHECKPOINT_ROOT:-}"
 
-if [[ -z "$model_variant" ]]; then
-    cfg_filename="${cfg_path##*/}"
-    cfg_stem="${cfg_filename%.py}"
-    case "$cfg_stem" in
-        mobilemamba_t2|mobilemamba_t4|mobilemamba_s6|mobilemamba_b1|mobilemamba_b2|mobilemamba_b4)
-            model_variant="${cfg_stem#mobilemamba_}"
-            ;;
-        *)
-            echo "Cannot infer model variant from CFG_PATH; set MODEL_VARIANT to T2, T4, S6, B1, B2, or B4" >&2
-            exit 2
-            ;;
-    esac
-fi
-model_variant="${model_variant^^}"
-case "$model_variant" in
-    T2|T4|S6|B1|B2|B4) ;;
-    *) echo 'MODEL_VARIANT must be T2, T4, S6, B1, B2, or B4' >&2; exit 2 ;;
-esac
-model_name="FMobileMamba_experiment_${model_variant}"
-checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet/300epochs_b1_wt_dwconv_${fft_kernel_size}}"
+resolve_experiment_model_name() {
+    local config_path="$1"
+    if "$python_bin" - "$config_path" <<'PY'
+import sys
+from argparse import Namespace
+from contextlib import redirect_stdout
+
+# Configuration imports may print diagnostics; stdout carries only the model name.
+with redirect_stdout(sys.stderr):
+    from configs import get_cfg
+
+    cfg = get_cfg(Namespace(
+        cfg_path=sys.argv[1], mode="train", sleep=-1, memory=-1,
+        dist_url="env://", logger_rank=0, opts=[],
+    ))
+    source_model_name = cfg.model.name
+
+if not isinstance(source_model_name, str) or not source_model_name:
+    raise SystemExit("model.name must be a nonempty string")
+
+model_names = {
+    f"{prefix}_{variant}": f"FMobileMamba_experiment_{variant}"
+    for prefix in ("MobileMamba", "FMobileMamba", "FMobileMamba_experiment")
+    for variant in ("T2", "T4", "S6", "B1", "B2", "B4")
+}
+if source_model_name not in model_names:
+    raise SystemExit(f"Unsupported model.name: {source_model_name!r}")
+print(model_names[source_model_name])
+PY
+    then
+        return 0
+    fi
+    echo "Cannot resolve model.name from configuration: $config_path" >&2
+    return 2
+}
+
+build_default_checkpoint_root() {
+    local epoch_full="$1"
+    local global_mode="$2"
+    local local_mode="$3"
+    local fft_kernel_size="$4"
+    local started_at="$5"
+    local root="runs/tiny_imagenet/${epoch_full}epochs_${global_mode}_${local_mode}"
+    if [[ "$global_mode" == fft ]]; then
+        root+="_${fft_kernel_size}"
+    fi
+    printf '%s_%s\n' "$root" "$started_at"
+}
 
 dry_run=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -72,13 +101,15 @@ if [[ ! "$master_port" =~ ^[0-9]+$ ]] || (( 10#$master_port < 1 || 10#$master_po
     echo 'MASTER_PORT must be between 1 and 65535' >&2
     exit 2
 fi
-[[ "${global_mode,,}" == fft ]] || { echo 'GLOBAL_MODE must be fft' >&2; exit 2; }
-global_mode=fft
+global_mode="${global_mode,,}"
+case "$global_mode" in fft|wt) ;; *) echo 'GLOBAL_MODE must be fft or wt' >&2; exit 2 ;; esac
 case "$local_mode" in layeroperator|dwconv|local_branch_new) ;; *) echo 'LOCAL_MODE must be layeroperator, dwconv, or local_branch_new' >&2; exit 2 ;; esac
 case "$local_kernel_set" in original|reduced) ;; *) echo 'LOCAL_KERNEL_SET must be original or reduced' >&2; exit 2 ;; esac
 force_dcnv3_rebuild="${force_dcnv3_rebuild,,}"
 case "$force_dcnv3_rebuild" in true|false) ;; *) echo 'FORCE_DCNV3_REBUILD must be true or false' >&2; exit 2 ;; esac
-case "$fft_kernel_size" in 3|5|7|k) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, or k' >&2; exit 2 ;; esac
+if [[ "$global_mode" == fft ]]; then
+    case "$fft_kernel_size" in 3|5|7|k) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, or k' >&2; exit 2 ;; esac
+fi
 ft="${ft,,}"
 case "$ft" in true|false) ;; *) echo 'FT must be true or false' >&2; exit 2 ;; esac
 for value in "$epoch_full" "$batch_size" "$nb_classes" "$save_per_epoch" "$test_per_epoch"; do
@@ -89,9 +120,8 @@ for value in "$seed" "$warmup_epochs" "$test_start_epoch" "$num_workers_per_gpu"
 done
 [[ "$learning_rate" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]] || { echo 'LEARNING_RATE must be numeric' >&2; exit 2; }
 [[ "$weight_decay" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]] || { echo 'WEIGHT_DECAY must be numeric' >&2; exit 2; }
-[[ -n "$checkpoint_root" ]] || { echo 'CHECKPOINT_ROOT must not be empty' >&2; exit 2; }
-[[ "$checkpoint_root" != runs/mobilemamba/500_epochs_mobilemamba ]] || { echo 'CHECKPOINT_ROOT must differ from baseline' >&2; exit 2; }
 
+effective_epoch_full="$epoch_full"
 for opt in "$@"; do
     if [[ "$opt" != *=* ]] || [[ "${opt%%=*}" != *.* && "${opt%%=*}" != nb_classes ]]; then
         echo "Expected path.key=value override: $opt" >&2
@@ -104,7 +134,22 @@ for opt in "$@"; do
             exit 2
             ;;
     esac
+    if [[ "$key" == trainer.epoch_full ]]; then
+        effective_epoch_full="${opt#*=}"
+    fi
 done
+[[ "$effective_epoch_full" =~ ^[1-9][0-9]*$ ]] || { echo 'trainer.epoch_full must be a positive integer' >&2; exit 2; }
+
+if ! model_name="$(resolve_experiment_model_name "$cfg_path")"; then
+    exit 2
+fi
+
+if [[ -z "$checkpoint_root" ]]; then
+    checkpoint_root="$(build_default_checkpoint_root \
+        "$effective_epoch_full" "$global_mode" "$local_mode" "$fft_kernel_size" "$started_at")"
+fi
+[[ -n "$checkpoint_root" ]] || { echo 'CHECKPOINT_ROOT must not be empty' >&2; exit 2; }
+[[ "$checkpoint_root" != runs/mobilemamba/500_epochs_mobilemamba ]] || { echo 'CHECKPOINT_ROOT must differ from baseline' >&2; exit 2; }
 
 opts=(
     "seed=$seed"

@@ -135,18 +135,18 @@ class SpectralExperimentFFTConvLayer(nn.Module):
 
 
 class FMobileMambaExperimentModel(MobileMamba):
-    """Install a specified FFT kernel in every configured model stage."""
+    """Select FFT or WT, customizing spectral kernels only for FFT."""
 
     def __init__(self, fft_kernel_size=3, local_kernel_set="reduced",
                  **model_options):
-        if type(fft_kernel_size) is int and fft_kernel_size in (3, 5, 7):
-            stage_kernel_sizes = (fft_kernel_size,) * 3
-        elif type(fft_kernel_size) is str and fft_kernel_size == "k":
-            stage_kernel_sizes = (7, 5, 3)
-        else:
-            raise ValueError("fft_kernel_size must be integer 3, 5, 7, or string 'k'")
-        if normalize_global_mode(model_options.get("global_mode", "fft")) != "fft":
-            raise ValueError("FMobileMamba_experiment only supports FFT mode")
+        global_mode = normalize_global_mode(model_options.get("global_mode", "fft"))
+        if global_mode == "fft":
+            if type(fft_kernel_size) is int and fft_kernel_size in (3, 5, 7):
+                stage_kernel_sizes = (fft_kernel_size,) * 3
+            elif type(fft_kernel_size) is str and fft_kernel_size == "k":
+                stage_kernel_sizes = (7, 5, 3)
+            else:
+                raise ValueError("fft_kernel_size must be integer 3, 5, 7, or string 'k'")
         stage_depths = tuple(model_options.get("depth", (1, 2, 2)))
         if (len(stage_depths) != 3
                 or any(type(depth) is not int or depth <= 0 for depth in stage_depths)):
@@ -161,11 +161,14 @@ class FMobileMambaExperimentModel(MobileMamba):
         if requested_local_mode == "local_branch_new":
             model_options["local_mode"] = "layeroperator"
             model_options["kernels_padding"] = stage_local_kernels
-        model_options["global_mode"] = "fft"
+        model_options["global_mode"] = global_mode
         super().__init__(**model_options)
 
         if requested_local_mode == "local_branch_new":
             self._install_local_branch_new(stage_local_kernels, stage_depths)
+
+        if global_mode != "fft":
+            return
 
         for stage, kernel_size, expected_count in zip(
                 (self.blocks1, self.blocks2, self.blocks3),
@@ -213,10 +216,10 @@ class FMobileMambaExperimentModel(MobileMamba):
 def _build_fmobilemamba_experiment(num_classes, distillation, fuse, model_cfg,
                                    global_mode, local_mode, fft_kernel_size,
                                    local_kernel_set):
-    if global_mode is not None and normalize_global_mode(global_mode) != "fft":
-        raise ValueError("FMobileMamba_experiment only supports FFT mode")
     options = dict(model_cfg)
-    options["global_mode"] = "fft"
+    options["global_mode"] = (
+        global_mode if global_mode is not None else options.get("global_mode", "fft")
+    )
     if local_mode is not None:
         options["local_mode"] = local_mode
     model = FMobileMambaExperimentModel(
