@@ -10,6 +10,7 @@ from util.net import trans_state_dict, print_networks, get_timepc, reduce_tensor
 from optim.scheduler import get_scheduler
 from data import get_loader
 from model import get_model
+from model.model_logging import log_model_configuration
 from optim import get_optim
 from loss import get_loss_terms
 from timm.data import Mixup
@@ -49,6 +50,9 @@ class BaseTrainer():
         log_msg(self.logger, '==> Using GPU: {} for Training'.format(list(range(cfg.world_size))))
         log_msg(self.logger, '==> Building model')
         self.net = get_model(cfg.model)
+        log_model_configuration(
+            self.logger, self.net, cfg.cfg_path, cfg.model.name,
+        )
         self.net.to('cuda:{}'.format(cfg.local_rank))
         self.net.eval()
         self.ema = cfg.trainer.ema
