@@ -75,7 +75,12 @@ def init_checkpoint(cfg, datefmt=None):
 		cfg.trainer.topk_recorder = state_dict['topk_recorder']
 	else:
 		if cfg.master:
-			logdir = '{}_{}_{}_{}'.format(cfg.trainer.name, cfg.model.name, cfg.data.type, time.strftime("%Y%m%d-%H%M%S"))
+			logdir = vars(cfg.trainer).get('logdir_name')
+			if logdir is None:
+				logdir = '{}_{}_{}_{}'.format(cfg.trainer.name, cfg.model.name, cfg.data.type, time.strftime("%Y%m%d-%H%M%S"))
+			elif (not isinstance(logdir, str) or not logdir or logdir in ('.', '..')
+					or '/' in logdir or '\\' in logdir):
+				raise ValueError('trainer.logdir_name must be a nonempty directory name without path separators')
 			cfg.logdir = '{}/{}'.format(cfg.trainer.checkpoint, logdir)
 			os.makedirs(cfg.logdir, exist_ok=True)
 			shutil.copy('{}.py'.format('/'.join(cfg.cfg_path.split('.'))), '{}/{}.py'.format(cfg.logdir, cfg.cfg_path.split('.')[-1]))

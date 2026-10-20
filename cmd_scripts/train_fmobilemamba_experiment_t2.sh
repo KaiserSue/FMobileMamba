@@ -6,18 +6,18 @@ cd -- "$script_dir/.."
 started_at="$(date +%m%d%H%M)"
 
 python_bin="${PYTHON_BIN:-python}"
-cfg_path="${CFG_PATH:-configs/mobilemamba/mobilemamba_t2.py}"
+cfg_path="${CFG_PATH:-configs/mobilemamba/mobilemamba_b1.py}"
 nproc_per_node="${NPROC_PER_NODE:-1}"
 master_port="${MASTER_PORT:-29500}"
 global_mode="${GLOBAL_MODE:-fft}"
-local_mode="${LOCAL_MODE:-dwconv}"
+local_mode="${LOCAL_MODE:-layeroperator}"
 local_kernel_set="${LOCAL_KERNEL_SET:-reduced}"
 force_dcnv3_rebuild="${FORCE_DCNV3_REBUILD:-false}"
 fft_kernel_size="${FFT_KERNEL_SIZE:-3}"
 seed="${SEED:-42}"
-epoch_full="${EPOCH_FULL:-500}"
+epoch_full="${EPOCH_FULL:-300}"
 warmup_epochs="${WARMUP_EPOCHS:-30}"
-test_start_epoch="${TEST_START_EPOCH:-400}"
+test_start_epoch="${TEST_START_EPOCH:-200}"
 batch_size="${BATCH_SIZE:-200}"
 learning_rate="${LEARNING_RATE:-1.5e-4}"
 weight_decay="${WEIGHT_DECAY:-0.05}"
@@ -27,8 +27,8 @@ save_per_epoch="${SAVE_PER_EPOCH:-20}"
 test_per_epoch="${TEST_PER_EPOCH:-5}"
 num_workers_per_gpu="${NUM_WORKERS_PER_GPU:-8}"
 resume_dir="${RESUME_DIR:-}"
-data_root="${DATA_ROOT:-}"
-checkpoint_root="${CHECKPOINT_ROOT:-}"
+data_root="${DATA_ROOT:-/home/apulis-dev/adhub/Tiny_ImageNet/0.1/tiny-imagenet-200}"
+checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet/300epoochs_}"
 
 resolve_experiment_model_name() {
     local config_path="$1"
@@ -66,17 +66,17 @@ PY
     return 2
 }
 
-build_default_checkpoint_root() {
+build_experiment_logdir_name() {
     local epoch_full="$1"
     local global_mode="$2"
     local local_mode="$3"
     local fft_kernel_size="$4"
     local started_at="$5"
-    local root="runs/tiny_imagenet/${epoch_full}epochs_${global_mode}_${local_mode}"
+    local name="${epoch_full}epochs_${global_mode}_${local_mode}"
     if [[ "$global_mode" == fft ]]; then
-        root+="_${fft_kernel_size}"
+        name+="_${fft_kernel_size}"
     fi
-    printf '%s_%s\n' "$root" "$started_at"
+    printf '%s_%s\n' "$name" "$started_at"
 }
 
 dry_run=false
@@ -129,7 +129,7 @@ for opt in "$@"; do
     fi
     key="${opt%%=*}"
     case "$key" in
-        model|model.name|model.model_kwargs|model.model_kwargs.global_mode|model.model_kwargs.local_mode|model.model_kwargs.local_kernel_set|model.model_kwargs.fft_kernel_size|nb_classes|data|data.nb_classes|trainer|trainer.mixup_kwargs|trainer.mixup_kwargs.num_classes|model.model_kwargs.num_classes)
+        model|model.name|model.model_kwargs|model.model_kwargs.global_mode|model.model_kwargs.local_mode|model.model_kwargs.local_kernel_set|model.model_kwargs.fft_kernel_size|nb_classes|data|data.nb_classes|trainer|trainer.logdir_name|trainer.mixup_kwargs|trainer.mixup_kwargs.num_classes|model.model_kwargs.num_classes)
             echo "Override is fixed for this model: $key" >&2
             exit 2
             ;;
@@ -144,10 +144,8 @@ if ! model_name="$(resolve_experiment_model_name "$cfg_path")"; then
     exit 2
 fi
 
-if [[ -z "$checkpoint_root" ]]; then
-    checkpoint_root="$(build_default_checkpoint_root \
-        "$effective_epoch_full" "$global_mode" "$local_mode" "$fft_kernel_size" "$started_at")"
-fi
+logdir_name="$(build_experiment_logdir_name \
+    "$effective_epoch_full" "$global_mode" "$local_mode" "$fft_kernel_size" "$started_at")"
 [[ -n "$checkpoint_root" ]] || { echo 'CHECKPOINT_ROOT must not be empty' >&2; exit 2; }
 [[ "$checkpoint_root" != runs/mobilemamba/500_epochs_mobilemamba ]] || { echo 'CHECKPOINT_ROOT must differ from baseline' >&2; exit 2; }
 
@@ -171,6 +169,7 @@ opts=(
     "trainer.test_per_epoch=$test_per_epoch"
     "trainer.data.num_workers_per_gpu=$num_workers_per_gpu"
     "trainer.checkpoint=$checkpoint_root"
+    "trainer.logdir_name=$logdir_name"
     "trainer.resume_dir=$resume_dir"
     "optim.lr=$learning_rate"
     "optim.optim_kwargs.weight_decay=$weight_decay"
