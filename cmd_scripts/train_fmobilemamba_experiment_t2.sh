@@ -103,8 +103,10 @@ if [[ ! "$master_port" =~ ^[0-9]+$ ]] || (( 10#$master_port < 1 || 10#$master_po
 fi
 global_mode="${global_mode,,}"
 case "$global_mode" in fft|wt) ;; *) echo 'GLOBAL_MODE must be fft or wt' >&2; exit 2 ;; esac
-case "$local_mode" in layeroperator|dwconv|local_branch_new) ;; *) echo 'LOCAL_MODE must be layeroperator, dwconv, or local_branch_new' >&2; exit 2 ;; esac
-case "$local_kernel_set" in original|reduced) ;; *) echo 'LOCAL_KERNEL_SET must be original or reduced' >&2; exit 2 ;; esac
+case "$local_mode" in layeroperator|dwconv|local_branch_new|ecd) ;; *) echo 'LOCAL_MODE must be layeroperator, dwconv, local_branch_new, or ecd' >&2; exit 2 ;; esac
+if [[ "$local_mode" == layeroperator ]]; then
+    case "$local_kernel_set" in original|reduced) ;; *) echo 'LOCAL_KERNEL_SET must be original or reduced' >&2; exit 2 ;; esac
+fi
 force_dcnv3_rebuild="${force_dcnv3_rebuild,,}"
 case "$force_dcnv3_rebuild" in true|false) ;; *) echo 'FORCE_DCNV3_REBUILD must be true or false' >&2; exit 2 ;; esac
 if [[ "$global_mode" == fft ]]; then
@@ -184,7 +186,7 @@ opts=(
     "model.model_kwargs.global_mode=$global_mode"
     "model.model_kwargs.local_mode=$local_mode"
 )
-if [[ "$local_mode" == local_branch_new ]]; then
+if [[ "$local_mode" == layeroperator ]]; then
     opts+=("model.model_kwargs.local_kernel_set=$local_kernel_set")
 fi
 if [[ -n "$data_root" ]]; then

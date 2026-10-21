@@ -1,5 +1,7 @@
 """MobileMamba experiments with selectable spectral and local kernels."""
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 
@@ -13,6 +15,7 @@ from model.mobilemamba.mobilemamba import (
     CFG_MobileMamba_T4,
     FFTConvLayer,
     LayerNorm,
+    Layer_operator,
     MBFFTConv2d,
     MobileMamba,
     MobileMambaModule,
@@ -125,6 +128,26 @@ class LocalBranchNew(nn.Module):
         return torch.cat((big_output, small_output), dim=1)
 
 
+class LocalBranchECD(Layer_operator):
+    """Keep the two local paths, replacing the large DW with stacked DW/GELU."""
+
+    def __init__(self, in_channel, num_blocks):
+        if type(in_channel) is not int or in_channel < 2:
+            raise ValueError("in_channel must be an integer >= 2")
+        if type(num_blocks) is not int or num_blocks not in (2, 3, 4):
+            raise ValueError("ECD num_blocks must be 2, 3, or 4")
+        super().__init__(in_channel, (2 * num_blocks + 1, num_blocks))
+        big_channels = self.split_channels[0]
+        layers = []
+        for _ in range(num_blocks):
+            layers.extend((
+                nn.Conv2d(big_channels, big_channels, kernel_size=3,
+                          stride=1, padding=1, dilation=1, groups=big_channels),
+                nn.GELU(),
+            ))
+        self.big_conv[2] = nn.Sequential(*layers)
+
+
 class SpectralExperimentFFTConvLayer(nn.Module):
     """Apply depthwise Conv-BN-ReLU units between a single FFT and IFFT."""
 
@@ -166,21 +189,33 @@ class FMobileMambaExperimentModel(MobileMamba):
         if (len(stage_depths) != 3
                 or any(type(depth) is not int or depth <= 0 for depth in stage_depths)):
             raise ValueError("model depth must contain three positive integers")
-        stage_local_kernels = _resolve_local_kernel_paddings(local_kernel_set)
         requested_local_mode = model_options.get("local_mode", "layeroperator")
         if requested_local_mode not in (
-                "layeroperator", "dwconv", "local_branch_new"):
+                "layeroperator", "dwconv", "local_branch_new", "ecd"):
             raise ValueError(
-                "local_mode must be layeroperator, dwconv, or local_branch_new"
+                "local_mode must be layeroperator, dwconv, local_branch_new, or ecd"
             )
-        if requested_local_mode == "local_branch_new":
+        if requested_local_mode == "layeroperator":
+            model_options["kernels_padding"] = _resolve_local_kernel_paddings(
+                local_kernel_set)
+        elif requested_local_mode == "local_branch_new":
+            stage_local_kernels = ((11, 5), (7, 3), (5, 2))
             model_options["local_mode"] = "layeroperator"
             model_options["kernels_padding"] = stage_local_kernels
+            stage_factories = tuple(
+                partial(LocalBranchNew, kernel_padding=kernel_padding)
+                for kernel_padding in stage_local_kernels)
+        elif requested_local_mode == "ecd":
+            model_options["local_mode"] = "layeroperator"
+            model_options["kernels_padding"] = ((9, 4), (7, 3), (5, 2))
+            stage_factories = tuple(
+                partial(LocalBranchECD, num_blocks=num_blocks)
+                for num_blocks in (4, 3, 2))
         model_options["global_mode"] = global_mode
         super().__init__(**model_options)
 
-        if requested_local_mode == "local_branch_new":
-            self._install_local_branch_new(stage_local_kernels, stage_depths)
+        if requested_local_mode in ("local_branch_new", "ecd"):
+            self._install_local_branches(stage_factories, stage_depths)
 
         if global_mode != "fft":
             return
@@ -198,11 +233,13 @@ class FMobileMambaExperimentModel(MobileMamba):
                 module.fft_conv = SpectralExperimentFFTConvLayer(
                     module.in_channels, kernel_size, num_blocks)
 
-    def _install_local_branch_new(self, stage_kernel_paddings, stage_depths):
+    def _install_local_branches(self, stage_factories, stage_depths):
+        if len(stage_factories) != 3 or len(stage_depths) != 3:
+            raise RuntimeError("local branches require three factories and depths")
         replacements = []
-        for stage_index, (stage, kernel_padding, expected_count) in enumerate(zip(
+        for stage_index, (stage, stage_factory, expected_count) in enumerate(zip(
                 (self.blocks1, self.blocks2, self.blocks3),
-                stage_kernel_paddings,
+                stage_factories,
                 stage_depths), start=1):
             local_nodes = [
                 module for module in stage.modules()
@@ -214,14 +251,14 @@ class FMobileMambaExperimentModel(MobileMamba):
                     f"expected {expected_count} nodes, found {len(local_nodes)}"
                 )
             for module in local_nodes:
-                if type(module.local_channels) is not int or module.local_channels <= 0:
+                if type(module.local_channels) is not int or module.local_channels < 2:
                     raise RuntimeError(
                         f"local branch stage {stage_index} has invalid channel count: "
                         f"{module.local_channels}"
                     )
                 replacements.append((
                     module,
-                    LocalBranchNew(module.local_channels, kernel_padding),
+                    stage_factory(in_channel=module.local_channels),
                 ))
 
         for module, local_op in replacements:
