@@ -21,6 +21,19 @@ from model.mobilemamba.mobilemamba import (
 )
 
 
+def _resolve_fft_stage_specs(fft_kernel_size):
+    if type(fft_kernel_size) is int and fft_kernel_size in (3, 5, 7):
+        return ((fft_kernel_size, 1),) * 3
+    if type(fft_kernel_size) is str:
+        if fft_kernel_size in ("k", "k1"):
+            return ((7, 1), (5, 1), (3, 1))
+        if fft_kernel_size == "k2":
+            return ((3, 3), (3, 2), (3, 1))
+    raise ValueError(
+        "fft_kernel_size must be integer 3, 5, 7, or string 'k', 'k1', 'k2'"
+    )
+
+
 def _resolve_local_kernel_paddings(local_kernel_set):
     kernel_sets = {
         "original": ((11, 5), (7, 3), (5, 2)),
@@ -113,40 +126,42 @@ class LocalBranchNew(nn.Module):
 
 
 class SpectralExperimentFFTConvLayer(nn.Module):
-    """Apply one depthwise convolution to the concatenated FFT components."""
+    """Apply depthwise Conv-BN-ReLU units between a single FFT and IFFT."""
 
-    def __init__(self, in_channel, kernel_size):
+    def __init__(self, in_channel, kernel_size, num_blocks=1):
         if type(in_channel) is not int or in_channel <= 0:
             raise ValueError("FFT input channels must be a positive integer")
         if type(kernel_size) is not int or kernel_size not in (3, 5, 7):
             raise ValueError("spectral kernel_size must be 3, 5, or 7")
+        if type(num_blocks) is not int or num_blocks not in (1, 2, 3):
+            raise ValueError("spectral num_blocks must be 1, 2, or 3")
+        if num_blocks > 1 and kernel_size != 3:
+            raise ValueError("stacked spectral blocks require kernel_size=3")
         super().__init__()
         spectral_channels = 2 * in_channel
         self.spectral = FFTConvLayer(in_channel)
-        self.spectral.conv = nn.Sequential(
-            nn.Conv2d(spectral_channels, spectral_channels, kernel_size=kernel_size,
-                      stride=1, padding=kernel_size // 2, groups=spectral_channels),
-            nn.BatchNorm2d(spectral_channels),
-            nn.ReLU(inplace=True),
-        )
+        layers = []
+        for _ in range(num_blocks):
+            layers.extend((
+                nn.Conv2d(spectral_channels, spectral_channels, kernel_size=kernel_size,
+                          stride=1, padding=kernel_size // 2, groups=spectral_channels),
+                nn.BatchNorm2d(spectral_channels),
+                nn.ReLU(inplace=True),
+            ))
+        self.spectral.conv = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.spectral(x)
 
 
 class FMobileMambaExperimentModel(MobileMamba):
-    """Select FFT or WT, customizing spectral kernels only for FFT."""
+    """Select FFT or WT; FFT accepts integers 3/5/7, k (k1 alias), k1, or k2."""
 
     def __init__(self, fft_kernel_size=3, local_kernel_set="reduced",
                  **model_options):
         global_mode = normalize_global_mode(model_options.get("global_mode", "fft"))
         if global_mode == "fft":
-            if type(fft_kernel_size) is int and fft_kernel_size in (3, 5, 7):
-                stage_kernel_sizes = (fft_kernel_size,) * 3
-            elif type(fft_kernel_size) is str and fft_kernel_size == "k":
-                stage_kernel_sizes = (7, 5, 3)
-            else:
-                raise ValueError("fft_kernel_size must be integer 3, 5, 7, or string 'k'")
+            stage_specs = _resolve_fft_stage_specs(fft_kernel_size)
         stage_depths = tuple(model_options.get("depth", (1, 2, 2)))
         if (len(stage_depths) != 3
                 or any(type(depth) is not int or depth <= 0 for depth in stage_depths)):
@@ -170,9 +185,9 @@ class FMobileMambaExperimentModel(MobileMamba):
         if global_mode != "fft":
             return
 
-        for stage, kernel_size, expected_count in zip(
+        for stage, (kernel_size, num_blocks), expected_count in zip(
                 (self.blocks1, self.blocks2, self.blocks3),
-                stage_kernel_sizes, stage_depths):
+                stage_specs, stage_depths):
             fft_nodes = [module for module in stage.modules()
                          if isinstance(module, MBFFTConv2d)]
             if len(fft_nodes) != expected_count:
@@ -181,7 +196,7 @@ class FMobileMambaExperimentModel(MobileMamba):
                     f"found {len(fft_nodes)}")
             for module in fft_nodes:
                 module.fft_conv = SpectralExperimentFFTConvLayer(
-                    module.in_channels, kernel_size)
+                    module.in_channels, kernel_size, num_blocks)
 
     def _install_local_branch_new(self, stage_kernel_paddings, stage_depths):
         replacements = []
@@ -237,6 +252,7 @@ def FMobileMamba_experiment_T2(num_classes=1000, pretrained=False,
                                model_cfg=CFG_MobileMamba_T2, global_mode=None,
                                local_mode=None, fft_kernel_size=3,
                                local_kernel_set="reduced"):
+    """Build T2; fft_kernel_size accepts 3/5/7, k (alias of k1), k1, k2."""
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
         fft_kernel_size, local_kernel_set)
@@ -248,6 +264,7 @@ def FMobileMamba_experiment_T4(num_classes=1000, pretrained=False,
                                model_cfg=CFG_MobileMamba_T4, global_mode=None,
                                local_mode=None, fft_kernel_size=3,
                                local_kernel_set="reduced"):
+    """Build T4; fft_kernel_size accepts 3/5/7, k (alias of k1), k1, k2."""
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
         fft_kernel_size, local_kernel_set)
@@ -259,6 +276,7 @@ def FMobileMamba_experiment_S6(num_classes=1000, pretrained=False,
                                model_cfg=CFG_MobileMamba_S6, global_mode=None,
                                local_mode=None, fft_kernel_size=3,
                                local_kernel_set="reduced"):
+    """Build S6; fft_kernel_size accepts 3/5/7, k (alias of k1), k1, k2."""
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
         fft_kernel_size, local_kernel_set)
@@ -270,6 +288,7 @@ def FMobileMamba_experiment_B1(num_classes=1000, pretrained=False,
                                model_cfg=CFG_MobileMamba_B1, global_mode=None,
                                local_mode=None, fft_kernel_size=3,
                                local_kernel_set="reduced"):
+    """Build B1; fft_kernel_size accepts 3/5/7, k (alias of k1), k1, k2."""
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
         fft_kernel_size, local_kernel_set)
@@ -281,6 +300,7 @@ def FMobileMamba_experiment_B2(num_classes=1000, pretrained=False,
                                model_cfg=CFG_MobileMamba_B2, global_mode=None,
                                local_mode=None, fft_kernel_size=3,
                                local_kernel_set="reduced"):
+    """Build B2; fft_kernel_size accepts 3/5/7, k (alias of k1), k1, k2."""
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
         fft_kernel_size, local_kernel_set)
@@ -292,6 +312,7 @@ def FMobileMamba_experiment_B4(num_classes=1000, pretrained=False,
                                model_cfg=CFG_MobileMamba_B4, global_mode=None,
                                local_mode=None, fft_kernel_size=3,
                                local_kernel_set="reduced"):
+    """Build B4; fft_kernel_size accepts 3/5/7, k (alias of k1), k1, k2."""
     return _build_fmobilemamba_experiment(
         num_classes, distillation, fuse, model_cfg, global_mode, local_mode,
         fft_kernel_size, local_kernel_set)

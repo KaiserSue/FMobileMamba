@@ -28,7 +28,7 @@ test_per_epoch="${TEST_PER_EPOCH:-5}"
 num_workers_per_gpu="${NUM_WORKERS_PER_GPU:-8}"
 resume_dir="${RESUME_DIR:-}"
 data_root="${DATA_ROOT:-/home/apulis-dev/adhub/Tiny_ImageNet/0.1/tiny-imagenet-200}"
-checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet/300epoochs_}"
+checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet}"
 
 resolve_experiment_model_name() {
     local config_path="$1"
@@ -108,7 +108,7 @@ case "$local_kernel_set" in original|reduced) ;; *) echo 'LOCAL_KERNEL_SET must 
 force_dcnv3_rebuild="${force_dcnv3_rebuild,,}"
 case "$force_dcnv3_rebuild" in true|false) ;; *) echo 'FORCE_DCNV3_REBUILD must be true or false' >&2; exit 2 ;; esac
 if [[ "$global_mode" == fft ]]; then
-    case "$fft_kernel_size" in 3|5|7|k) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, or k' >&2; exit 2 ;; esac
+    case "$fft_kernel_size" in 3|5|7|k|k1|k2) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, k, k1, or k2' >&2; exit 2 ;; esac
 fi
 ft="${ft,,}"
 case "$ft" in true|false) ;; *) echo 'FT must be true or false' >&2; exit 2 ;; esac
