@@ -28,7 +28,7 @@ test_per_epoch="${TEST_PER_EPOCH:-5}"
 num_workers_per_gpu="${NUM_WORKERS_PER_GPU:-8}"
 resume_dir="${RESUME_DIR:-}"
 data_root="${DATA_ROOT:-/home/apulis-dev/adhub/Tiny_ImageNet/0.1/tiny-imagenet-200}"
-checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet}"
+checkpoint_root="${CHECKPOINT_ROOT:-runs/tiny_imagenet/1}"
 
 resolve_experiment_model_name() {
     local config_path="$1"
