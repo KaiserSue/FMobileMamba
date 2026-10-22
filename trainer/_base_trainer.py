@@ -3,7 +3,9 @@ import glob
 import copy
 import shutil
 import datetime
+import math
 from argparse import Namespace
+from typing import Optional
 import torch
 from util.util import makedirs, log_cfg, able, log_msg, get_log_terms, update_log_term, accuracy
 from util.net import trans_state_dict, print_networks, get_timepc, reduce_tensor
@@ -106,7 +108,10 @@ class BaseTrainer():
         self.scheduler = get_scheduler(cfg, self.optim)
         self.topk_recorder = cfg.trainer.topk_recorder
         self.loss_recorder = LossRecorder(cfg.logdir_train, logger=self.logger) if self.master else None
-        self.train_loss_cutoff = cfg.trainer.test_start_epoch
+        if self.master:
+            self.epoch_train_loss_sum = 0.0
+            self.epoch_train_loss_count = 0
+            self.epoch_train_loss_valid = True
         if not hasattr(cfg, 'plot') or cfg.plot is None:
             cfg.plot = Namespace()
         if not hasattr(cfg.plot, 'loss_dir') or cfg.plot.loss_dir is None:
@@ -178,8 +183,26 @@ class BaseTrainer():
                 current_params.data.copy_(ema_params.data)
 
 
-    def optimize_parameters(self):
-        pass
+    def optimize_parameters(self) -> Optional[float]:
+        return None
+
+    def _accumulate_train_loss(self, batch_loss: Optional[float]) -> None:
+        self.epoch_train_loss_count += 1
+        if batch_loss is None or not math.isfinite(batch_loss):
+            self.epoch_train_loss_valid = False
+            return
+        self.epoch_train_loss_sum += batch_loss
+
+    def _record_epoch_train_loss(self) -> None:
+        if self.epoch_train_loss_valid and self.epoch_train_loss_count > 0:
+            self.loss_recorder.append(
+                self.epoch, self.epoch_train_loss_sum / self.epoch_train_loss_count)
+        else:
+            log_msg(self.logger, f'Skip training loss for epoch {self.epoch}: '
+                                 'invalid batch loss or no training batches')
+        self.epoch_train_loss_sum = 0.0
+        self.epoch_train_loss_count = 0
+        self.epoch_train_loss_valid = True
 
     def post_update(self):
         if not self.cfg.trainer.mixup_kwargs or not self.isTrain:
@@ -208,9 +231,9 @@ class BaseTrainer():
             loss_dir = getattr(self, 'loss_output_dir', default_loss_dir)
             loss_filename = self.cfg.plot.loss_filename if self.cfg.plot.loss_filename else 'train_loss.jpg'
             output_path = self.loss_recorder.plot(
-                loss_dir, loss_filename, title='Train Loss', max_epoch=self.train_loss_cutoff)
+                loss_dir, loss_filename, title='Train Loss', max_epoch=None)
             log_msg(self.logger, f'loss curve saved to {output_path}') if output_path else None
-            self.loss_recorder.export_txt(self.loss_txt_path, max_epoch=self.train_loss_cutoff)
+            self.loss_recorder.export_txt(self.loss_txt_path, max_epoch=None)
         self.writer.close() if self.master else None
         topk_list = [self.topk_recorder['net_top1'], self.topk_recorder['net_top5']]
         topk_list.extend([self.topk_recorder['net_E_top1'], self.topk_recorder['net_E_top5']]) if self.ema else None
@@ -224,6 +247,8 @@ class BaseTrainer():
         f.close()
 
     def train(self):
+        if self.master:
+            self.loss_recorder.prepare_training_history(self.epoch)
         self.reset(isTrain=True, train_mode=self.train_mode)
         self.check_bn()
         self.train_loader.sampler.set_epoch(int(self.epoch)) if self.cfg.dist else None
@@ -240,7 +265,9 @@ class BaseTrainer():
             t2 = get_timepc()
             update_log_term(self.log_terms.get('data_t'), t2 - t1, 1, self.master)
             # ---------- optimization ----------
-            self.optimize_parameters()
+            batch_loss = self.optimize_parameters()
+            if self.master:
+                self._accumulate_train_loss(batch_loss)
             t3 = get_timepc()
             update_log_term(self.log_terms.get('optim_t'), t3 - t2, 1, self.master)
             update_log_term(self.log_terms.get('batch_t'), t3 - t1, 1, self.master)
@@ -259,6 +286,8 @@ class BaseTrainer():
             # ---------- update train_loader ----------
             if self.iter % train_length == 0:
                 self.epoch += 1
+                if self.master:
+                    self._record_epoch_train_loss()
                 if self.cfg.dist and self.dist_BN != '':
                     distribute_bn(self.net, self.world_size, self.dist_BN)
                     distribute_bn(self.net_E, self.world_size, self.dist_BN)

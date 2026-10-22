@@ -2,6 +2,8 @@ import os
 import copy
 import shutil
 import datetime
+import math
+from typing import Optional
 import torch
 import torch.nn.functional as F
 from util.util import makedirs, log_cfg, able, log_msg, get_log_terms, update_log_term, accuracy
@@ -56,7 +58,7 @@ class CLSTrainer(BaseTrainer):
 				dispatch_clip_grad(self.net.parameters(), value=self.cfg.loss.clip_grad)
 			optim.step()
 
-	def optimize_parameters(self):
+	def optimize_parameters(self) -> Optional[float]:
 		# Mixup data augmentation
 		if self.mixup_fn is not None:
 			self.imgs, self.targets = self.mixup_fn(self.imgs, self.targets)
@@ -72,9 +74,13 @@ class CLSTrainer(BaseTrainer):
 			loss_ce = self.loss_terms['CE'](self.outputs['out'], self.targets) if not nan_or_inf_out else 0
 			loss_kd = (self.loss_terms['KD'](self.outputs['out_kd'], self.imgs) if self.loss_terms.get('KD', None) else 0) if not nan_or_inf_out else 0
 		self.backward_term((loss_ce + loss_kd) if not nan_or_inf_out else (0 * self.outputs['out'][0, 0]), self.optim)
-		update_log_term(self.log_terms.get('CE'), reduce_tensor(loss_ce, self.world_size).clone().detach().item(), 1, self.master)
-		update_log_term(self.log_terms.get('KD'), reduce_tensor(loss_kd, self.world_size).clone().detach().item(), 1, self.master)
+		global_ce = reduce_tensor(loss_ce, self.world_size).clone().detach().item()
+		global_kd = reduce_tensor(loss_kd, self.world_size).clone().detach().item()
+		update_log_term(self.log_terms.get('CE'), global_ce, 1, self.master)
+		update_log_term(self.log_terms.get('KD'), global_kd, 1, self.master)
 		self._update_ema()
+		batch_loss = global_ce + global_kd
+		return batch_loss if not nan_or_inf_out and math.isfinite(batch_loss) else None
 
 	@torch.no_grad()
 	def get_val_loss(self):
@@ -97,14 +103,6 @@ class CLSTrainer(BaseTrainer):
 		max_top1 = max(self.topk_recorder['net_top1'])
 		max_top1_idx = self.topk_recorder['net_top1'].index(max_top1) + 1
 		msg = 'Max [top1: {:>3.3f} (epoch: {:d})]'.format(max_top1, max_top1_idx)
-		if self.master and self.loss_recorder:
-			if self.epoch >= self.train_loss_cutoff:
-				self.loss_recorder.truncate_after(self.train_loss_cutoff)
-				log_msg(self.logger, 'skip writing train loss during test stage')
-			elif loss_valid and avg_loss is not None:
-				self.loss_recorder.record_train_loss(epoch=self.epoch, loss=avg_loss, cutoff_epoch=self.train_loss_cutoff)
-			else:
-				log_msg(self.logger, 'skip writing train loss due to invalid value')
 		if self.ema:
 			top1_ema, top5_ema, _, _ = self.test_net(self.net_E, name='net_E')
 			self.is_best_ema = True if len(self.topk_recorder['net_E_top1']) == 0 or top1_ema > max(

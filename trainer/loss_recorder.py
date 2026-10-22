@@ -1,6 +1,8 @@
 import json
 import math
 import os
+import tempfile
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib
@@ -14,7 +16,41 @@ class LossRecorder:
         self.logger = logger
         self.checkpoint_dir = checkpoint_dir
         self.json_path = os.path.join(checkpoint_dir, filename)
+        self.meta_path = os.path.splitext(self.json_path)[0] + '.meta.json'
         self.records: Dict[str, float] = self.load_history()
+
+    def prepare_training_history(self, completed_epoch: int) -> None:
+        if type(completed_epoch) is not int or completed_epoch < 0:
+            raise ValueError('completed_epoch must be a non-negative integer')
+        metadata = dict(schema_version=1, source='training_objective',
+                        aggregation='mean_of_step_rank_means')
+        if os.path.exists(self.meta_path):
+            with open(self.meta_path, 'r') as f:
+                actual = json.load(f)
+            if (not isinstance(actual, dict) or actual != metadata
+                    or type(actual.get('schema_version')) is not int):
+                raise ValueError(f'Incompatible training loss metadata: {self.meta_path}')
+            self.truncate_after(completed_epoch + 1)
+            return
+
+        # Validate before moving a legacy file; corrupt history must remain intact.
+        self.load_history()
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        if os.path.exists(self.json_path):
+            stem = os.path.splitext(self.json_path)[0]
+            backup_path = f'{stem}.legacy-{uuid.uuid4().hex}.json'
+            os.rename(self.json_path, backup_path)
+            if self.logger is not None:
+                self.logger.info(f'Unknown loss source backed up to {backup_path}; '
+                                 'missing historical training loss will not be reconstructed')
+        self.records = {}
+        with open(self.json_path, 'w') as f:
+            json.dump(self.records, f)
+        with tempfile.NamedTemporaryFile(mode='w', dir=self.checkpoint_dir,
+                                         prefix='.train_loss.meta-', delete=False) as f:
+            json.dump(metadata, f)
+            temp_path = f.name
+        os.replace(temp_path, self.meta_path)
 
     def load_history(self) -> Dict[str, float]:
         if not os.path.exists(self.json_path):
@@ -22,6 +58,13 @@ class LossRecorder:
             return self.records
         with open(self.json_path, 'r') as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f'Loss history must be an object: {self.json_path}')
+        for epoch, loss in data.items():
+            if not epoch.isdecimal() or int(epoch) <= 0 or str(int(epoch)) != epoch:
+                raise ValueError(f'Invalid epoch in loss history: {epoch}')
+            if type(loss) not in (int, float) or not math.isfinite(loss):
+                raise ValueError(f'Invalid loss in history at epoch {epoch}: {loss}')
         self.records = {str(k): float(v) for k, v in data.items()}
         return self.records
 
@@ -84,4 +127,6 @@ class LossRecorder:
                 f.write(f'{epoch}, {loss}\n')
 
     def append(self, epoch: int, loss: float) -> None:
+        if type(epoch) is not int or epoch <= 0:
+            raise ValueError('epoch must be a positive integer')
         self.record_train_loss(epoch, loss, cutoff_epoch=math.inf)
