@@ -6,7 +6,8 @@ from timm.data.constants import IMAGENET_DEFAULT_STD as _IMAGENET_DEFAULT_STD
 import torchvision.transforms.functional as _F
 # =========> shared <=================================
 seed = 42
-size = 192
+_model_cfg = _deepcopy(_CFG_B1)
+size = _model_cfg['img_size']
 epoch_full = 500
 warmup_epochs = 30
 test_start_epoch = 400
@@ -47,8 +48,7 @@ data.test_transforms = [
 # =========> model <=================================
 model = _Namespace()
 model.name = 'FMobileMamba_B1'
-_model_cfg = _deepcopy(_CFG_B1)
-_model_cfg.update(img_size=192, in_chans=3, stages=['s', 's', 's'],
+_model_cfg.update(in_chans=3, stages=['s', 's', 's'],
                   kernels_padding=[[11, 5], [7, 3], [5, 2]],
                   down_ops=[['subsample', 2], ['subsample', 2], ['']],
                   forward_type='v052d', global_mode='fft', local_mode='layeroperator')

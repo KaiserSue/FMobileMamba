@@ -1,11 +1,14 @@
 from argparse import Namespace as _Namespace
+from copy import deepcopy as _deepcopy
+from model.mobilemamba.mobilemamba import CFG_MobileMamba_T4 as _CFG_T4
 from timm.data.constants import IMAGENET_DEFAULT_MEAN as _IMAGENET_DEFAULT_MEAN
 from timm.data.constants import IMAGENET_DEFAULT_STD as _IMAGENET_DEFAULT_STD
 import torchvision.transforms.functional as _F
 
 # =========> shared <=================================
 seed = 42
-size = 192
+_model_cfg = _deepcopy(_CFG_T4)
+size = _model_cfg['img_size']
 epoch_full = 300
 warmup_epochs = 20
 test_start_epoch = 200
@@ -44,7 +47,8 @@ data.test_transforms = [
 # =========> model <=================================
 model = _Namespace()
 model.name = 'MobileMamba_T4'
-model.model_kwargs = dict(pretrained=False, checkpoint_path='', ema=False, strict=True, num_classes=data.nb_classes)
+model.model_kwargs = dict(pretrained=False, checkpoint_path='', ema=False, strict=True,
+                          num_classes=data.nb_classes, model_cfg=_model_cfg)
 
 # =========> optimizer <=================================
 optim = _Namespace()
