@@ -1,4 +1,6 @@
 import argparse
+import logging
+import os
 from configs import get_cfg
 from util.net import init_training
 from util.util import run_pre, init_checkpoint
@@ -26,4 +28,9 @@ def main():
 
 
 if __name__ == '__main__':
-	main()
+	try:
+		main()
+	except Exception:
+		logging.exception('Training entry point failed (rank=%s)',
+		                  os.environ.get('RANK', os.environ.get('SLURM_PROCID', '0')))
+		raise
