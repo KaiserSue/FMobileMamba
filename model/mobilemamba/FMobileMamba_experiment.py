@@ -129,7 +129,7 @@ class LocalBranchNew(nn.Module):
 
 
 class LocalBranchECD(Layer_operator):
-    """Keep the two local paths, replacing the large DW with stacked DW/GELU."""
+    """Fuse intermediate DW/GELU scales for depths 4/3; keep depth 2 unchanged."""
 
     def __init__(self, in_channel, num_blocks):
         if type(in_channel) is not int or in_channel < 2:
@@ -146,6 +146,32 @@ class LocalBranchECD(Layer_operator):
                 nn.GELU(),
             ))
         self.big_conv[2] = nn.Sequential(*layers)
+        self.num_blocks = num_blocks
+        self.tap_block_indices = {4: (2, 3), 3: (2,), 2: ()}[num_blocks]
+        if self.tap_block_indices:
+            concatenated_channels = in_channel + len(self.tap_block_indices) * big_channels
+            self.multiscale_fuse = nn.Conv2d(concatenated_channels, in_channel, 1)
+        else:
+            self.multiscale_fuse = nn.Identity()
+
+    def forward(self, x):
+        if not self.tap_block_indices:
+            return super().forward(x)
+
+        normalized = self.norm1(x)
+        big_input, small_input = torch.split(normalized, self.split_channels, dim=1)
+        hidden = self.big_conv[1](self.big_conv[0](big_input))
+        tapped_features = []
+        for layer_index, layer in enumerate(self.big_conv[2]):
+            hidden = layer(hidden)
+            # Each complete DW/GELU unit ends at an odd flat layer index.
+            if layer_index % 2 == 1 and (layer_index + 1) // 2 in self.tap_block_indices:
+                tapped_features.append(hidden)
+
+        big_output = self.conv1x1_2(hidden + self.conv1x1_1(big_input))
+        small_output = self.small_conv(self.conv1x1_3(small_input))
+        concatenated = torch.cat((big_output, *tapped_features, small_output), dim=1)
+        return self.multiscale_fuse(concatenated)
 
 
 class SpectralExperimentFFTConvLayer(nn.Module):
