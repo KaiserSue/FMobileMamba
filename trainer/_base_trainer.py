@@ -5,6 +5,7 @@ import shutil
 import datetime
 import math
 from argparse import Namespace
+from contextlib import contextmanager
 from typing import Optional
 import torch
 from util.util import makedirs, log_cfg, able, log_msg, get_log_terms, update_log_term, accuracy
@@ -13,6 +14,9 @@ from optim.scheduler import get_scheduler
 from data import get_loader
 from model import get_model
 from model.model_logging import log_model_configuration
+from model.mobilemamba.FMobileMamba_experiment import FMobileMambaExperimentModel
+from model.mobilemamba.rep_blocks import RepDepthwise3x3
+from model.mobilemamba.rep_deploy import convert_rep_model
 from optim import get_optim
 from loss import get_loss_terms
 from timm.data import Mixup
@@ -24,6 +28,7 @@ try:
     from apex.parallel import DistributedDataParallel as ApexDDP
     from apex.parallel import convert_syncbn_model as ApexSyncBN
 except:
+    ApexDDP = ()
     from timm.layers.norm_act import convert_sync_batchnorm as ApexSyncBN
 from timm.layers.norm_act import convert_sync_batchnorm as TIMMSyncBN
 
@@ -65,7 +70,14 @@ class BaseTrainer():
             self.net_E = None
         log_msg(self.logger, f"==> Load checkpoint: {cfg.model.model_kwargs['checkpoint_path']}") if \
         cfg.model.model_kwargs['checkpoint_path'] else None
-        print_networks([self.net], self.cfg.size, self.logger)
+        with self._evaluation_model(self.net) as stats_net:
+            try:
+                if stats_net is not self.net:
+                    log_msg(self.logger, '==> MODEL STATS: deploy=True (Rep fusion only); '
+                                         'MODEL CONFIGURATION describes the training structure')
+                print_networks([stats_net], self.cfg.size, self.logger)
+            finally:
+                del stats_net
         log_global_mode(self.logger, self.net)
         self.dist_BN = cfg.trainer.dist_BN
         if cfg.dist and cfg.trainer.sync_BN != 'none':
@@ -139,6 +151,34 @@ class BaseTrainer():
             pass
         self.train_mode = True if self.cfg.mode == 'train' else False
         log_cfg(self.cfg)
+
+    @contextmanager
+    def _evaluation_model(self, net):
+        """Yield a fresh FP32 Rep deployment copy, preserving the source model."""
+        native_ddp = isinstance(net, NativeDDP)
+        apex_ddp = isinstance(net, ApexDDP)
+        source = net.module if native_ddp or apex_ddp else net
+        if not isinstance(source, FMobileMambaExperimentModel) or not any(
+                isinstance(module, RepDepthwise3x3) for module in source.modules()):
+            yield net
+            return
+
+        snapshot = candidate = None
+        try:
+            snapshot = copy.deepcopy(source).eval().float()
+            if native_ddp and net.broadcast_buffers:
+                group = net.process_group
+                root = torch.distributed.get_global_rank(group, 0)
+                # Match DDP's buffer selection, including explicitly ignored buffers.
+                for name, buffer in snapshot.named_buffers():
+                    if name not in net.parameters_to_ignore:
+                        torch.distributed.broadcast(buffer, src=root, group=group)
+            candidate = convert_rep_model(snapshot)
+            del snapshot
+            yield candidate
+        finally:
+            # Do not retain snapshots in a contextmanager frame after an exception.
+            snapshot = candidate = None
 
     def reset(self, isTrain=True, train_mode=True, prefix=None):
         self.isTrain = isTrain
@@ -321,27 +361,33 @@ class BaseTrainer():
         total_loss_sum = 0.0
         total_sample_cnt = 0
         loss_valid = True
-        while batch_idx < test_length:
-            t1 = get_timepc()
-            batch_idx += 1
-            test_data = next(test_loader)
-            self.set_input(test_data)
-            self.forward(net)
-            self.post_update()
-            if collect_loss:
-                batch_loss, batch_sample_cnt, batch_valid = self.get_val_loss()
-                loss_valid = loss_valid and batch_valid
-                if batch_valid and batch_sample_cnt > 0:
-                    total_loss_sum += batch_loss
-                    total_sample_cnt += batch_sample_cnt
-            t2 = get_timepc()
-            update_log_term(self.log_terms.get('batch_t'), t2 - t1, 1, self.master)
-            # ---------- log ----------
-            if self.master:
-                if batch_idx % self.cfg.logging.test_log_per == 0 or batch_idx == test_length:
-                    msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix=f'Test ({name})'),
-                               self.master, None)
-                    log_msg(self.logger, msg) if vis else None
+        with self._evaluation_model(net) as eval_net:
+            try:
+                while batch_idx < test_length:
+                    t1 = get_timepc()
+                    batch_idx += 1
+                    test_data = next(test_loader)
+                    self.set_input(test_data)
+                    if eval_net is not net:
+                        self.imgs = self.imgs.float()
+                    self.forward(eval_net)
+                    self.post_update()
+                    if collect_loss:
+                        batch_loss, batch_sample_cnt, batch_valid = self.get_val_loss()
+                        loss_valid = loss_valid and batch_valid
+                        if batch_valid and batch_sample_cnt > 0:
+                            total_loss_sum += batch_loss
+                            total_sample_cnt += batch_sample_cnt
+                    t2 = get_timepc()
+                    update_log_term(self.log_terms.get('batch_t'), t2 - t1, 1, self.master)
+                    # ---------- log ----------
+                    if self.master:
+                        if batch_idx % self.cfg.logging.test_log_per == 0 or batch_idx == test_length:
+                            msg = able(self.progress.get_msg(batch_idx, test_length, 0, 0, prefix=f'Test ({name})'),
+                                       self.master, None)
+                            log_msg(self.logger, msg) if vis else None
+            finally:
+                del eval_net
         top1 = self.log_terms.get('top1_cnt').sum * 100. / min(self.cfg.data.test_length,
                                                                self.log_terms.get('top_all').sum) if self.log_terms.get(
             'top_all').sum > 0 else 0

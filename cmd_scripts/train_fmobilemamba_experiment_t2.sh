@@ -103,14 +103,18 @@ if [[ ! "$master_port" =~ ^[0-9]+$ ]] || (( 10#$master_port < 1 || 10#$master_po
 fi
 global_mode="${global_mode,,}"
 case "$global_mode" in fft|wt) ;; *) echo 'GLOBAL_MODE must be fft or wt' >&2; exit 2 ;; esac
-case "$local_mode" in layeroperator|dwconv|local_branch_new|ecd) ;; *) echo 'LOCAL_MODE must be layeroperator, dwconv, local_branch_new, or ecd' >&2; exit 2 ;; esac
+case "$local_mode" in layeroperator|dwconv|local_branch_new|ecd|MultiRep) ;; *) echo 'LOCAL_MODE must be layeroperator, dwconv, local_branch_new, ecd, or MultiRep' >&2; exit 2 ;; esac
 if [[ "$local_mode" == layeroperator ]]; then
     case "$local_kernel_set" in original|reduced) ;; *) echo 'LOCAL_KERNEL_SET must be original or reduced' >&2; exit 2 ;; esac
 fi
 force_dcnv3_rebuild="${force_dcnv3_rebuild,,}"
 case "$force_dcnv3_rebuild" in true|false) ;; *) echo 'FORCE_DCNV3_REBUILD must be true or false' >&2; exit 2 ;; esac
 if [[ "$global_mode" == fft ]]; then
-    case "$fft_kernel_size" in 3|5|7|k|k1|k2) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, k, k1, or k2' >&2; exit 2 ;; esac
+    case "$fft_kernel_size" in 3|5|7|k|k1|k2|rep) ;; *) echo 'FFT_KERNEL_SIZE must be 3, 5, 7, k, k1, k2, or rep' >&2; exit 2 ;; esac
+fi
+if [[ "$global_mode" == wt && "$fft_kernel_size" == rep ]]; then
+    echo 'FFT_KERNEL_SIZE=rep requires GLOBAL_MODE=fft' >&2
+    exit 2
 fi
 ft="${ft,,}"
 case "$ft" in true|false) ;; *) echo 'FT must be true or false' >&2; exit 2 ;; esac
@@ -131,7 +135,7 @@ for opt in "$@"; do
     fi
     key="${opt%%=*}"
     case "$key" in
-        model|model.name|model.model_kwargs|model.model_kwargs.global_mode|model.model_kwargs.local_mode|model.model_kwargs.local_kernel_set|model.model_kwargs.fft_kernel_size|nb_classes|data|data.nb_classes|trainer|trainer.logdir_name|trainer.mixup_kwargs|trainer.mixup_kwargs.num_classes|model.model_kwargs.num_classes)
+        model|model.name|model.model_kwargs|model.model_kwargs.global_mode|model.model_kwargs.local_mode|model.model_kwargs.local_kernel_set|model.model_kwargs.fft_kernel_size|model.model_kwargs.deploy|model.model_kwargs.fuse|nb_classes|data|data.nb_classes|trainer|trainer.logdir_name|trainer.mixup_kwargs|trainer.mixup_kwargs.num_classes|model.model_kwargs.num_classes)
             echo "Override is fixed for this model: $key" >&2
             exit 2
             ;;
@@ -178,6 +182,8 @@ opts=(
     "data.nb_classes=$nb_classes"
     "model.name=$model_name"
     "model.model_kwargs.num_classes=$nb_classes"
+    "model.model_kwargs.deploy=False"
+    "model.model_kwargs.fuse=False"
     "model.model_kwargs.fft_kernel_size=$fft_kernel_size"
     "trainer.mixup_kwargs.num_classes=$nb_classes"
     "trainer.mixup_kwargs.mixup_alpha=0.5"
